@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  clipfactory-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    container_name: clipfactory-dev
+    volumes:
+      # monta el código fuente del proyecto para development sin reconstruir
+      - ./app:/opt/clipfactory/app
+      - ./config:/opt/clipfactory/config
+      - ./credentials:/opt/clipfactory/credentials
+      - ./data:/opt/clipfactory/data
+      - ./database:/opt/clipfactory/database
+      - ./logs:/opt/clipfactory/logs
+      # carpeta temporal para builds
+      - ./tmp:/tmp/clipfactory-build
+    environment:
+      - CLIPFACTORY_DATA_DIR=/opt/clipfactory/data
+      - CLIPFACTORY_DB_PATH=/opt/clipfactory/database/clipfactory.db
+      - CLIPFACTORY_LOG_DIR=/opt/clipfactory/logs
+      - CLIPFACTORY_CONFIG_DIR=/opt/clipfactory/config
+      - CLIPFACTORY_CREDENTIALS_DIR=/opt/clipfactory/credentials
+      - CLIPFACTORY_LOG_LEVEL=debug
+      # ruta del binario de descarga de clips (instalado en la imagen)
+      - CLIPFACTORY_TWITCH_DOWNLOADER_PATH=TwitchDownloaderCLI
+    # mantener el contenedor corriendo para poder ejecutar comandos
+    # mantener el contenedor corriendo para poder ejecutar comandos con 'docker compose exec'
+    command: ["sleep", "infinity"]
+    restart: "no"
