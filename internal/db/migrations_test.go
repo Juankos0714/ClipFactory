@@ -1,5 +1,8 @@
 package db
 
+// Tests del esquema: migraciones idempotentes, foreign keys con cascada,
+// InitDB con DSN completo y estructura de las tablas.
+
 import (
 	"database/sql"
 	"fmt"

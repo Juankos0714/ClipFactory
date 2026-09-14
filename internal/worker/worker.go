@@ -39,7 +39,9 @@ import (
 	"github.com/juankos0714/clipfactory/internal/adapter/twitch"
 	"github.com/juankos0714/clipfactory/internal/adapter/youtube"
 	"github.com/juankos0714/clipfactory/internal/db"
-)	// WorkerConfig define la configuración del worker.
+)
+
+// WorkerConfig define la configuración del worker.
 //
 // DB permite inyectar una conexión existente (útil para tests, que comparten una
 // DB :memory: entre el test y el worker). En producción DB es nil y el worker abre
@@ -51,13 +53,13 @@ import (
 // (adaptador de Twitch + ffmpeg + YouTube); en tests se usan fakes. Si son
 // nil, los jobs correspondientes fallan con un mensaje claro.
 type WorkerConfig struct {
-	DB                *sql.DB
-	Discoverer        Discoverer
-	Downloader        Downloader
-	Processor         Processor
-	Thumbnailer       Thumbnailer
-	Publisher         Publisher
-	DataDir           string // raíz de archivos (incoming/, completed/, thumbnails/)
+	DB                *sql.DB     // nil = el worker abre su propia conexión con InitDB(DBPath)
+	Discoverer        Discoverer  // job 'discovery' (nil = esos jobs fallan con mensaje claro)
+	Downloader        Downloader  // job 'download'  (idem)
+	Processor         Processor   // job 'process'   (idem)
+	Thumbnailer       Thumbnailer // job 'thumbnail' (idem)
+	Publisher         Publisher   // job 'publish'   (idem)
+	DataDir           string      // raíz de archivos (incoming/, completed/, thumbnails/)
 	DBPath            string
 	WorkerID          string
 	MaxConcurrentJobs int
@@ -67,9 +69,9 @@ type WorkerConfig struct {
 // DefaultWorkerConfig retorna la configuración por defecto para el hardware objetivo (i3-3220, 2 núcleos).
 func DefaultWorkerConfig(dbPath string) WorkerConfig {
 	return WorkerConfig{
-		DBPath:             dbPath,
+		DBPath:            dbPath,
 		WorkerID:          "worker-main",
-		MaxConcurrentJobs: 2, // 1 ffmpeg + 1 download
+		MaxConcurrentJobs: 2, // 1 ffmpeg + 1 download: adecuado para el i3-3220 (2 núcleos)
 		PollInterval:      5 * time.Second,
 	}
 }
@@ -125,18 +127,22 @@ type Publisher interface {
 }
 
 // Worker es el proceso que ejecuta la cola de trabajos.
+//
+// Campos internos (no configurables): cada capacidad guardada acá es la versión
+// "resuelta" de WorkerConfig (si cfg.Discoverer era nil, discoverer queda nil y el
+// job fallará con mensaje claro).
 type Worker struct {
 	cfg         WorkerConfig
-	db          *sql.DB
-	discoverer  Discoverer  // nil = jobs 'discovery' fallan con mensaje claro
-	downloader  Downloader  // nil = jobs 'download' fallan con mensaje claro
-	processor   Processor   // nil = jobs 'process' fallan con mensaje claro
-	thumbnailer Thumbnailer // nil = jobs 'thumbnail' fallan con mensaje claro
-	publisher   Publisher   // nil = jobs 'publish' fallan con mensaje claro
-	ownDB       bool        // true si el worker abrió su propia conexión (y debe cerrarla)
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	started     atomic.Bool
+	db          *sql.DB        // conexión a SQLite (inyectada o propia)
+	discoverer  Discoverer     // nil = jobs 'discovery' fallan con mensaje claro
+	downloader  Downloader     // nil = jobs 'download' fallan con mensaje claro
+	processor   Processor      // nil = jobs 'process' fallan con mensaje claro
+	thumbnailer Thumbnailer    // nil = jobs 'thumbnail' fallan con mensaje claro
+	publisher   Publisher      // nil = jobs 'publish' fallan con mensaje claro
+	ownDB       bool           // true si el worker abrió su propia conexión (y debe cerrarla)
+	stopCh      chan struct{}  // cerrado por Stop(): apaga el loop y las goroutines
+	wg          sync.WaitGroup // espera a loop + jobs en curso al hacer Stop()
+	started     atomic.Bool    // guarda Start/Stop idempotentes y sin carreras
 }
 
 // DefaultDataDir es el directorio de datos por defecto (coincide con config.LoadConfig).
@@ -281,12 +287,6 @@ func (w *Worker) processJobs(ctx context.Context) {
 	}
 }
 
-// executeJob despacha un job según su tipo y lo marca como done al terminar.
-//
-// Cualquier pánico en el handler se recupera y marca el job como error (el job
-// no queda colgado en 'running' hasta el stale-lock de 30s).
-// Los handlers aún son stubs (TODO): simulan trabajo con Sleep para que el
-// pipeline completo sea navegable de punta a punta.
 // executeJob despacha un job según su tipo y lo marca como done o error.
 //
 // Contrato de los handlers:

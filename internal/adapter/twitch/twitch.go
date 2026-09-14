@@ -47,15 +47,19 @@ type PlatformAdapter interface {
 }
 
 // ClipInfo representa la metadata de un clip obtenida del origen.
+//
+// Es una estructura NEUTRA: no menciona a Twitch — el worker y la DB trabajan
+// con ella, de modo que agregar Kick u otra plataforma solo requiere mapear
+// su respuesta a este mismo struct.
 type ClipInfo struct {
-	ID            string
-	Title         string
-	DurationSec   float64
-	CreatedAt     time.Time
-	ThumbnailURL  string
-	VideoURL      string // URL de descarga del video (puede ser obtenida por herramienta externa)
-	ChannelID     string
-	ChannelName   string
+	ID           string
+	Title        string
+	DurationSec  float64
+	CreatedAt    time.Time
+	ThumbnailURL string
+	VideoURL     string // URL de descarga del video (puede ser obtenida por herramienta externa)
+	ChannelID    string
+	ChannelName  string
 }
 
 // TwitchAdapter implementa PlatformAdapter para Twitch usando la API Helix.
@@ -65,7 +69,10 @@ type TwitchAdapter struct {
 	HTTPClient     *http.Client
 	BaseURL        string // URL base de la API (sobrescribible para tests)
 	downloaderPath string // ruta a TwitchDownloaderCLI para descargar videos
-}// NewTwitchAdapter crea un nuevo adaptador de Twitch.
+}
+
+// NewTwitchAdapter crea un nuevo adaptador de Twitch con defaults de producción:
+// HTTP client con timeout de 30s, API real de Twitch y TwitchDownloaderCLI en PATH.
 func NewTwitchAdapter(clientID, authToken string) *TwitchAdapter {
 	return &TwitchAdapter{
 		ClientID:       clientID,
@@ -112,21 +119,21 @@ type helixPagination struct {
 // helixClip es un clip individual de la respuesta de Helix.
 // Los comentarios de cada campo documentan el mapeo a ClipInfo.
 type helixClip struct {
-	ID              string  `json:"id"`              // → ClipInfo.ID (y source_clips.platform_clip_id)
-	URL             string  `json:"url"`             // página pública del clip (no es la URL del video)
-	EmbedURL        string  `json:"embed_url"`       // player embebible
+	ID              string  `json:"id"`               // → ClipInfo.ID (y source_clips.platform_clip_id)
+	URL             string  `json:"url"`              // página pública del clip (no es la URL del video)
+	EmbedURL        string  `json:"embed_url"`        // player embebible
 	BroadcasterID   string  `json:"broadcaster_id"`   // → ClipInfo.ChannelID
 	BroadcasterName string  `json:"broadcaster_name"` // → ClipInfo.ChannelName
 	CreatorID       string  `json:"creator_id"`       // quien recortó el clip (no el streamer)
 	CreatorName     string  `json:"creator_name"`
-	VideoID         string  `json:"video_id"`    // VOD del que proviene el clip ("" si el VOD expiró)
-	GameID          string  `json:"game_id"`      // categoría del stream (para filtrar en el futuro)
-	Language        string  `json:"language"`    // "es", "en", ...
-	Title           string  `json:"title"`       // → ClipInfo.Title
-	ViewCount       int     `json:"view_count"`  // popularidad (útil para ordenar/filtrar)
-	CreatedAt       string  `json:"created_at"`  // RFC3339 → ClipInfo.CreatedAt
+	VideoID         string  `json:"video_id"`      // VOD del que proviene el clip ("" si el VOD expiró)
+	GameID          string  `json:"game_id"`       // categoría del stream (para filtrar en el futuro)
+	Language        string  `json:"language"`      // "es", "en", ...
+	Title           string  `json:"title"`         // → ClipInfo.Title
+	ViewCount       int     `json:"view_count"`    // popularidad (útil para ordenar/filtrar)
+	CreatedAt       string  `json:"created_at"`    // RFC3339 → ClipInfo.CreatedAt
 	ThumbnailURL    string  `json:"thumbnail_url"` // → ClipInfo.ThumbnailURL
-	Duration        float64 `json:"duration"`    // segundos → ClipInfo.DurationSec
+	Duration        float64 `json:"duration"`      // segundos → ClipInfo.DurationSec
 }
 
 // toClipInfo mapea un clip de Helix a la estructura neutra de ClipFactory.

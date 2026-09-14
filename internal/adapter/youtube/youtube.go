@@ -13,10 +13,10 @@
 //
 // UPLOAD RESUMABLE (videos.insert):
 //
-//	1. POST /upload/youtube/v3/videos?uploadType=resumable&part=snippet,status
-//	   con los metadatos JSON → responde 200 y header Location (session URL)
-//	2. PUT <session URL> con los bytes del video
-//	3. 200/201 → { id, status } con el videoId externo
+//  1. POST /upload/youtube/v3/videos?uploadType=resumable&part=snippet,status
+//     con los metadatos JSON → responde 200 y header Location (session URL)
+//  2. PUT <session URL> con los bytes del video
+//  3. 200/201 → { id, status } con el videoId externo
 //
 // CUOTAS: cada upload cuesta ~1600 unidades del default diario de 10,000
 // (≈6 uploads/día). El worker trata el error 403 quotaExceeded como
@@ -43,6 +43,10 @@ const (
 )
 
 // Publisher publica videos en YouTube.
+//
+// Es stateless respecto a los videos (cada UploadVideo es independiente) y
+// stateful SOLO en el cache del access token (protegido con mutex). Los campos
+// TokenURL/UploadURL existen para que los tests apunten a un httptest.Server.
 type Publisher struct {
 	ClientID     string
 	ClientSecret string
@@ -52,13 +56,13 @@ type Publisher struct {
 	PrivacyStatus string // "public", "unlisted", "private" (default: "public")
 	CategoryID    string // categoryId de YouTube (default: "20" = Gaming)
 
-	TokenURL  string // endpoint OAuth (tests)
-	UploadURL string // endpoint videos.insert (tests)
+	TokenURL  string // endpoint OAuth (sobrescribible en tests)
+	UploadURL string // endpoint videos.insert (sobrescribible en tests)
 
 	HTTPClient *http.Client
 
 	// cache del access token (thread-safe: varios jobs pueden publicar a la vez)
-	mu        sync.Mutex
+	mu          sync.Mutex
 	accessToken string
 	tokenExpiry time.Time
 }
@@ -163,8 +167,8 @@ type videoSnippet struct {
 }
 
 type videoStatus struct {
-	PrivacyStatus      string `json:"privacyStatus"`
-	SelfDeclaredMadeForKids bool `json:"selfDeclaredMadeForKids"`
+	PrivacyStatus           string `json:"privacyStatus"`
+	SelfDeclaredMadeForKids bool   `json:"selfDeclaredMadeForKids"` // YouTube exige declararlo explícitamente
 }
 
 type videoResource struct {

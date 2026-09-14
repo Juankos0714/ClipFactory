@@ -18,10 +18,15 @@ Diseñado para correr en hardware modesto (i3-3220, 2 núcleos) sobre un servido
 5. [Configuración](#configuración)
 6. [Cómo ejecutar](#cómo-ejecutar)
 7. [Tests](#tests)
-8. [Guía de Twitch](docs/guia-twitch.md) ← guía paso a paso para clips de Twitch
-9. [Guía de YouTube](docs/guia-youtube.md) ← OAuth, cuotas y publicación
-9. [Decisiones de diseño](#decisiones-de-diseño)
-10. [Roadmap](#roadmap)
+8. [Decisiones de diseño](#decisiones-de-diseño)
+9. [Roadmap](#roadmap)
+
+**Guías detalladas:**
+
+- [docs/arquitectura-y-decisiones.md](docs/arquitectura-y-decisiones.md) ← todas las decisiones técnicas explicadas
+- [docs/guia-de-uso.md](docs/guia-de-uso.md) ← guía de uso paso a paso (setup, operación, troubleshooting, deploy)
+- [docs/guia-twitch.md](docs/guia-twitch.md) ← guía paso a paso para clips de Twitch
+- [docs/guia-youtube.md](docs/guia-youtube.md) ← OAuth, cuotas y publicación
 
 ---
 
@@ -264,6 +269,13 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/app" -w /app \
 - `PRAGMA foreign_keys = ON` se ejecuta explícitamente: los parámetros DSN
   `_foreign_keys=on` no siempre son honrados por el driver `modernc.org/sqlite`.
 - Las comparaciones de timestamps usan texto RFC3339, no `datetime()` de SQLite.
+
+**Documentación completa:**
+
+- [**Arquitectura y decisiones técnicas**](docs/arquitectura-y-decisiones.md) — el porqué de cada decisión (SQLite+WAL, cola en DB, RFC3339, CGO_ENABLED=0, HTTP directo para YouTube, etc.), máquinas de estado y limitaciones.
+- [**Guía de uso paso a paso**](docs/guia-de-uso.md) — desde cero: requisitos, primer arranque, credenciales, ejecutar el pipeline, consultas de DB, re-encolar jobs, troubleshooting y deploy en el servidor.
+- [Guía de Twitch](docs/guia-twitch.md) — credenciales, API Helix, channel IDs y descarga con TwitchDownloaderCLI.
+- [Guía de YouTube](docs/guia-youtube.md) — OAuth refresh token, cuotas de la API y el job publish.
 
 ## Decisiones de diseño
 

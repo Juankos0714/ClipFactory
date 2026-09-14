@@ -1,5 +1,8 @@
 package db
 
+// Tests complementarios del CRUD: clips, publications (backoff/next_retry_at),
+// jobs (locking) y cleanup con retención. Reusa helpers de models_test.go.
+
 import (
 	"database/sql"
 	"os"

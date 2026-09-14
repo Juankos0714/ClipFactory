@@ -1,5 +1,8 @@
 package worker
 
+// Tests del ciclo de vida del worker: creación, Start/Stop, procesamiento de
+// jobs encolados, concurrencia y locking de la cola.
+
 import (
 	"database/sql"
 	"testing"

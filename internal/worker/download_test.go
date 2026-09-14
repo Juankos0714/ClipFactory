@@ -1,5 +1,9 @@
 package worker
 
+// Tests del job 'download': descarga exitosa, idempotencia (video ya existente,
+// clip ya downloaded), fallo del Downloader (marca error en source_clips) y
+// casos borde (clip inexistente, downloader nil).
+
 import (
 	"context"
 	"errors"
@@ -438,7 +442,7 @@ func TestDownloadCreatesIncomingDir(t *testing.T) {
 		t.Errorf("expected file in incoming dir: %v", err)
 	}
 	_ = fmt.Sprint() // mantener import fmt usado
-	_ = w           // worker original sin uso adicional
+	_ = w            // worker original sin uso adicional
 }
 
 // mkdirDownloader envuelve otro Downloader y crea el directorio destino antes de

@@ -1,6 +1,4 @@
-package config
-
-// Carga de configuración de ClipFactory.
+// Package config carga la configuración de ClipFactory.
 //
 // FUENTES DE CONFIGURACIÓN (en orden de uso):
 //
@@ -8,13 +6,16 @@ package config
 //     Son la vía principal: funcionan igual en bare metal y en Docker
 //     (docker-compose.yml ya las define para el contenedor de desarrollo).
 //
-//  2. credentials/twitch.conf: archivo clave=valor estilo .env con las credenciales
-//     de Twitch (CLIENT_ID, AUTH_TOKEN). Formato documentado en docs/guia-twitch.md.
+//  2. credentials/twitch.conf y credentials/youtube.conf: archivos clave=valor
+//     estilo .env con las credenciales por plataforma. Formato documentado en
+//     docs/guia-twitch.md y docs/guia-youtube.md.
 //
 //  3. config/sources.yaml (FUTURO): canales a monitorear. loadSources es un stub.
 //
 // Las credenciales viven separadas de la config para poder montar credentials/ con
-// permisos restringidos (y para no commitear nunca secretos).
+// permisos restringidos (y para no commitear nunca secretos: credentials/ está
+// en .gitignore).
+package config
 
 import (
 	"fmt"
@@ -27,22 +28,25 @@ import (
 )
 
 // Config representa la configuración completa de ClipFactory.
+//
+// Es un struct plano y sin dependencias: los paquetes internos (worker, adapters)
+// reciben solo los campos que necesitan, nunca este struct entero.
 type Config struct {
-	// Paths
-	DataDir        string
-	DBPath         string
-	LogDir         string
-	ConfigDir      string
-	CredentialsDir string
+	// --- Rutas de directorios y archivos (todas configurables por env var) ---
+	DataDir        string // raíz de archivos de video: data/{incoming,completed,...}
+	DBPath         string // ruta de la DB SQLite (database/clipfactory.db)
+	LogDir         string // directorio de logs de la aplicación
+	ConfigDir      string // directorio de config (sources.yaml, futuro)
+	CredentialsDir string // directorio con twitch.conf / youtube.conf
 
-	// Logging
-	LogLevel       string
+	// --- Logging ---
+	LogLevel string // "debug", "info", "warn", "error"
 
-	// Worker
-	MaxConcurrentJobs int
-	PollInterval      time.Duration
+	// --- Worker ---
+	MaxConcurrentJobs int           // jobs en paralelo (default: NumCPU)
+	PollInterval      time.Duration // frecuencia de sondeo de la cola (default: 5s)
 
-	// Sources: canales a monitorear
+	// Sources: canales a monitorear (hoy siempre vacío: loadSources es stub)
 	Sources []SourceConfig
 
 	// Platform credentials (cargadas desde archivos en credentials/)
@@ -51,10 +55,10 @@ type Config struct {
 	// Meta, TikTok, Kick se agregan en fases posteriores
 
 	// Ruta al binario TwitchDownloaderCLI (para el job 'download').
-	// Default: "TwitchDownloaderCLI" (se asume en PATH).
+	// Default: "TwitchDownloaderCLI" (se asume en PATH; la imagen Docker lo incluye).
 	TwitchDownloaderPath string
 
-	// Ruta al binario ffmpeg (para el job 'process').
+	// Ruta al binario ffmpeg (para los jobs 'process' y 'thumbnail').
 	// Default: "ffmpeg" (se asume en PATH; la imagen Docker lo incluye).
 	FFmpegPath string
 }
@@ -67,14 +71,15 @@ type SourceConfig struct {
 	Active      bool   // monitorear o no
 }
 
-// TwitchConfig representa las credenciales de Twitch.
+// TwitchConfig representa las credenciales de Twitch (credentials/twitch.conf).
 type TwitchConfig struct {
-	ClientID  string // Client-ID de la app registrada en Twitch
-	AuthToken string // OAuth token (opcional para algunos endpoints)
+	ClientID  string // Client-ID de la app registrada en Twitch (obligatorio)
+	AuthToken string // App Access Token (opcional para /helix/clips, sube el rate limit)
 }
 
-// YouTubeConfig representa las credenciales de la YouTube Data API v3.
-// El RefreshToken se genera UNA VEZ fuera del pipeline (docs/guia-youtube.md §4).
+// YouTubeConfig representa las credenciales de la YouTube Data API v3
+// (credentials/youtube.conf). El RefreshToken se genera UNA VEZ fuera del
+// pipeline (docs/guia-youtube.md §4).
 type YouTubeConfig struct {
 	ClientID      string
 	ClientSecret  string
@@ -86,38 +91,40 @@ type YouTubeConfig struct {
 // LoadConfig carga la configuración desde variables de entorno y archivos de credentials.
 //
 // Tolerancia a fallos deliberada: los archivos OPCIONALES (sources.yaml,
-// twitch.conf) no existen en una instalación fresca y su ausencia NO es error.
-// Pero si el archivo existe y no se puede leer (permisos, es un directorio...),
-// eso SÍ es error: mejor fallar temprano que descubrirlo en producción.
+// twitch.conf, youtube.conf) no existen en una instalación fresca y su ausencia NO
+// es error (cada fase del pipeline valida sus propias credenciales cuando las
+// necesita). Pero si el archivo existe y no se puede leer (permisos, es un
+// directorio...), eso SÍ es error: mejor fallar temprano que descubrirlo en producción.
 func LoadConfig() (*Config, error) {
+	// 1) variables de entorno con defaults para todo (ver getEnv* más abajo)
 	cfg := &Config{
-		DataDir:        getEnv("CLIPFACTORY_DATA_DIR", "./data"),
-		DBPath:         getEnv("CLIPFACTORY_DB_PATH", "./database/clipfactory.db"),
-		LogDir:         getEnv("CLIPFACTORY_LOG_DIR", "./logs"),
-		ConfigDir:      getEnv("CLIPFACTORY_CONFIG_DIR", "./config"),
-		CredentialsDir: getEnv("CLIPFACTORY_CREDENTIALS_DIR", "./credentials"),
-		LogLevel:       getEnv("CLIPFACTORY_LOG_LEVEL", "info"),
-		MaxConcurrentJobs: getEnvInt("CLIPFACTORY_MAX_CONCURRENT_JOBS", runtime.NumCPU()),
-		PollInterval:      getEnvDuration("CLIPFACTORY_POLL_INTERVAL", "5s"),
+		DataDir:              getEnv("CLIPFACTORY_DATA_DIR", "./data"),
+		DBPath:               getEnv("CLIPFACTORY_DB_PATH", "./database/clipfactory.db"),
+		LogDir:               getEnv("CLIPFACTORY_LOG_DIR", "./logs"),
+		ConfigDir:            getEnv("CLIPFACTORY_CONFIG_DIR", "./config"),
+		CredentialsDir:       getEnv("CLIPFACTORY_CREDENTIALS_DIR", "./credentials"),
+		LogLevel:             getEnv("CLIPFACTORY_LOG_LEVEL", "info"),
+		MaxConcurrentJobs:    getEnvInt("CLIPFACTORY_MAX_CONCURRENT_JOBS", runtime.NumCPU()),
+		PollInterval:         getEnvDuration("CLIPFACTORY_POLL_INTERVAL", "5s"),
 		TwitchDownloaderPath: getEnv("CLIPFACTORY_TWITCH_DOWNLOADER_PATH", "TwitchDownloaderCLI"),
 		FFmpegPath:           getEnv("CLIPFACTORY_FFMPEG_PATH", "ffmpeg"),
 	}
 
-	// cargar fuentes desde archivo de config (si existe)
+	// 2) sources.yaml (canales a monitorear) — opcional, stub hoy
 	sources, err := loadSources(filepath.Join(cfg.ConfigDir, "sources.yaml"))
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("load sources config: %w", err)
 	}
 	cfg.Sources = sources
 
-	// cargar credenciales de Twitch desde archivo (si existe)
+	// 3) credentials/twitch.conf — opcional
 	twitchCfg, err := loadTwitchConfig(filepath.Join(cfg.CredentialsDir, "twitch.conf"))
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("load twitch config: %w", err)
 	}
 	cfg.Twitch = twitchCfg
 
-	// cargar credenciales de YouTube desde archivo (si existe)
+	// 4) credentials/youtube.conf — opcional
 	ytCfg, err := loadYouTubeConfig(filepath.Join(cfg.CredentialsDir, "youtube.conf"))
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("load youtube config: %w", err)
@@ -127,9 +134,12 @@ func LoadConfig() (*Config, error) {
 	return cfg, nil
 }
 
+// loadSources carga los canales a monitorear desde config/sources.yaml.
+//
+// TODO: implementar lectura de YAML/JSON de fuentes.
+// Por ahora retorna nil (sin canales): los canales se insertan directo en la
+// tabla `sources` de la DB (ver docs/guia-twitch.md §9).
 func loadSources(path string) ([]SourceConfig, error) {
-	// TODO: implementar lectura de YAML/JSON de fuentes
-	// Por ahora retornamos un slice vacío
 	return nil, nil
 }
 
@@ -144,7 +154,6 @@ func loadSources(path string) ([]SourceConfig, error) {
 //
 // El test TestLoadTwitchConfig documenta este comportamiento con ejemplos.
 func loadTwitchConfig(path string) (TwitchConfig, error) {
-	// leer archivo de credenciales (formato clave=valor, similar a .env)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return TwitchConfig{}, err
@@ -154,12 +163,15 @@ func loadTwitchConfig(path string) (TwitchConfig, error) {
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
+		// saltar líneas vacías y comentarios
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		// SplitN(2): clave = todo antes del primer '=', valor = el resto
+		// (así un token con '=' adentro no se corrompe)
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
-			continue
+			continue // línea sin '=' → ignorar
 		}
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
@@ -177,11 +189,12 @@ func loadTwitchConfig(path string) (TwitchConfig, error) {
 // twitch.conf) y aplica defaults para los campos opcionales.
 //
 // Claves reconocidas:
-//   CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN (obligatorios para publicar)
-//   PRIVACY_STATUS (default "public"), CATEGORY_ID (default "20" = Gaming)
+//
+//	CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN (obligatorios para publicar)
+//	PRIVACY_STATUS (default "public"), CATEGORY_ID (default "20" = Gaming)
 func loadYouTubeConfig(path string) (YouTubeConfig, error) {
-	// mismo formato que twitch.conf: leer con el mismo parser genérico
-	// (se redeclara la lectura porque loadTwitchConfig mapea claves de Twitch)
+	// mismo formato que twitch.conf: se redeclara la lectura porque
+	// loadTwitchConfig mapea claves de Twitch (refactor futuro: parser genérico)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return YouTubeConfig{}, err
@@ -214,7 +227,7 @@ func loadYouTubeConfig(path string) (YouTubeConfig, error) {
 		}
 	}
 
-	// defaults opcionales (los obligatorios los valida Validate/Publisher)
+	// defaults para los campos opcionales (los obligatorios los valida el Publisher)
 	if cfg.PrivacyStatus == "" {
 		cfg.PrivacyStatus = "public"
 	}
@@ -224,6 +237,7 @@ func loadYouTubeConfig(path string) (YouTubeConfig, error) {
 	return cfg, nil
 }
 
+// getEnv lee una variable de entorno y devuelve el default si está vacía o no existe.
 func getEnv(key, defaultValue string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -231,6 +245,9 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+// getEnvInt lee una variable de entorno como int; si falta o no es numérica,
+// devuelve el default (los valores inválidos NO son error: fallar por una
+// env var mal escrita mataría el worker entero).
 func getEnvInt(key string, defaultValue int) int {
 	if v := os.Getenv(key); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
@@ -240,6 +257,8 @@ func getEnvInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
+// getEnvDuration lee una variable de entorno como time.Duration (ej: "5s", "1m");
+// si falta o es inválida, usa el default (y como último recurso 5s fijo).
 func getEnvDuration(key string, defaultValue string) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -256,7 +275,8 @@ func getEnvDuration(key string, defaultValue string) time.Duration {
 //
 // Lo mínimo indispensable: si no hay DataDir o DBPath el pipeline no puede correr.
 // Un Twitch.ClientID vacío NO es error fatal (permite desarrollar el pipeline sin
-// credenciales), pero el discovery no podrá llamar a Helix — se valida en su lugar.
+// credenciales — los jobs que las necesitan fallan con mensaje claro), pero el
+// discovery no podrá llamar a Helix.
 func (c *Config) Validate() error {
 	if c.DataDir == "" {
 		return fmt.Errorf("data dir no configurado")

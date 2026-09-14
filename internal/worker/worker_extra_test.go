@@ -1,5 +1,8 @@
 package worker
 
+// Tests complementarios del worker: errores de construcción, Start/Stop
+// idempotentes (doble Start, Stop sin Start, doble Stop) y handlers nil.
+
 import (
 	"database/sql"
 	"os"

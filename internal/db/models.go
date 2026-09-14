@@ -31,10 +31,10 @@ import (
 // Active=1 y crea source_clips por cada clip nuevo encontrado.
 type Source struct {
 	ID            int64
-	Platform      string
-	ChannelID     string
-	ChannelName   string
-	Active        bool
+	Platform      string // "twitch", "kick"
+	ChannelID     string // ID numérico del canal en la plataforma
+	ChannelName   string // nombre legible (logs y display)
+	Active        bool   // 1 = el discovery lo consulta, 0 = pausado
 	LastCheckedAt *time.Time
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
@@ -43,38 +43,40 @@ type Source struct {
 // SourceClip representa un clip detectado en el origen antes de descargarlo.
 //
 // Máquina de estados (columna Status):
-//   detected   → el discovery lo vio, aún no se descarga
-//   downloaded → existe una fila en videos apuntando acá
-//   skipped    → decidimos no descargarlo (p.ej. demasiado corto, visto antes)
-//   error      → la descarga falló ( ErrorMessage con el detalle)
+//
+//	detected   → el discovery lo vio, aún no se descarga
+//	downloaded → existe una fila en videos apuntando acá
+//	skipped    → decidimos no descargarlo (p.ej. demasiado corto, visto antes)
+//	error      → la descarga falló ( ErrorMessage con el detalle)
 type SourceClip struct {
-	ID                  int64
-	Platform            string
-	PlatformClipID      string
-	SourceID            int64
-	Title               string
-	DurationSeconds     float64
-	CreatedAtPlatform   *time.Time
-	Status              string // detected, downloaded, skipped, error
-	ErrorMessage        string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                int64
+	Platform          string
+	PlatformClipID    string // ID del clip en la plataforma (UNIQUE con Platform)
+	SourceID          int64  // FK a sources
+	Title             string
+	DurationSeconds   float64
+	CreatedAtPlatform *time.Time // fecha de creación del clip EN la plataforma
+	Status            string     // detected, downloaded, skipped, error
+	ErrorMessage      string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // Video representa un archivo descargado localmente.
 //
 // Máquina de estados (columna Status):
-//   incoming   → descargado a data/incoming/, esperando proceso
-//   processing → ffmpeg está trabajando con él
-//   completed  → clips generados y verificados
-//   failed     → el proceso falló ( ErrorMessage con el detalle)
+//
+//	incoming   → descargado a data/incoming/, esperando proceso
+//	processing → ffmpeg está trabajando con él
+//	completed  → clips generados y verificados
+//	failed     → el proceso falló ( ErrorMessage con el detalle)
 //
 // Filepath es UNIQUE: la ruta local identifica al archivo y hace idempotente
 // la descarga (un reintento no crea dos filas para el mismo archivo).
 type Video struct {
 	ID              int64
-	SourceClipID    int64
-	Filepath        string
+	SourceClipID    int64  // FK a source_clips
+	Filepath        string // ruta local (UNIQUE: hace idempotente la descarga)
 	DurationSeconds float64
 	Width           int
 	Height          int
@@ -91,19 +93,19 @@ type Video struct {
 // YouTube Shorts/TikTok/Reels. Width/Height deberían ser siempre 1080/1920
 // (el schema lo documenta como comentario; validarlo es tarea del proceso).
 type Clip struct {
-	ID             int64
-	VideoID        int64
-	StartTimeSec   float64
-	EndTimeSec     float64
-	Filepath       string
-	ThumbnailPath  string
-	DurationSec    float64
-	Width          int
-	Height         int
-	Status         string // processing, completed, failed
-	ErrorMessage   string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID            int64
+	VideoID       int64 // FK a videos
+	StartTimeSec  float64
+	EndTimeSec    float64
+	Filepath      string // ruta del clip vertical (UNIQUE)
+	ThumbnailPath string // ruta del JPEG de vista previa (lo llena el job thumbnail)
+	DurationSec   float64
+	Width         int    // 1080 en el pipeline actual
+	Height        int    // 1920 en el pipeline actual
+	Status        string // processing, completed, failed
+	ErrorMessage  string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // Publication representa un intento de publicación en una plataforma específica.
@@ -115,18 +117,18 @@ type Clip struct {
 // Estados: pending → published | error | waiting_rate_limit.
 // UpdatePublicationStatus incrementa Attempts en cada intento.
 type Publication struct {
-	ID             int64
-	ClipID         int64
-	Platform       string
-	Status         string // pending, published, error, waiting_rate_limit
-	Attempts       int
-	NextRetryAt    *time.Time
-	ExternalID     string
-	ExternalURL    string
-	ErrorMessage   string
-	PublishedAt    *time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID           int64
+	ClipID       int64  // FK a clips
+	Platform     string // youtube, meta, tiktok, kick
+	Status       string // pending, published, error, waiting_rate_limit
+	Attempts     int    // intentos fallidos (alimenta el backoff exponencial)
+	NextRetryAt  *time.Time
+	ExternalID   string // videoId en la plataforma externa (ej: "dQw4w9WgXcQ")
+	ExternalURL  string // URL pública (ej: https://youtu.be/<id>)
+	ErrorMessage string
+	PublishedAt  *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // Job representa un trabajo en la cola interna.
@@ -139,17 +141,17 @@ type Publication struct {
 // de 30 segundos (semántica "at-least-once": el trabajo puede repetirse, la
 // idempotencia la dan los UNIQUE del esquema).
 type Job struct {
-	ID             int64
-	Type           string // discovery, download, process, thumbnail, publish
-	ReferenceID    int64
-	ReferenceType  string
-	Status         string // queued, running, done, error
-	Attempts       int
-	LockedAt       *time.Time
-	LockedBy       string
-	ErrorMessage   string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID            int64
+	Type          string // discovery, download, process, thumbnail, publish
+	ReferenceID   int64  // ID de la fila a la que apunta (cambia según ReferenceType)
+	ReferenceType string // "sources", "source_clips", "videos", "clips", "publications"
+	Status        string // queued, running, done, error
+	Attempts      int
+	LockedAt      *time.Time
+	LockedBy      string
+	ErrorMessage  string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // Log representa un registro de evento para auditoría.
@@ -393,7 +395,10 @@ func UpdateSourceClipStatus(db *sql.DB, id int64, status, errorMessage string) e
 	return err
 }
 
-// InsertVideo inserta un video descargado.
+// InsertVideo inserta un video descargado (status 'incoming' por convención del caller).
+// Devuelve el ID generado en v.ID. Si el filepath ya existe el INSERT falla por el
+// UNIQUE; el caller (executeDownload) interpreta eso como "otro worker ganó" y reusa
+// la fila existente en vez de duplicar.
 func InsertVideo(db *sql.DB, v *Video) error {
 	res, err := db.Exec(
 		`INSERT INTO videos (source_clip_id, filepath, duration_seconds, width, height, file_hash, status, created_at, updated_at)
@@ -469,7 +474,9 @@ func UpdateVideoStatus(db *sql.DB, id int64, status, errorMessage string) error 
 	return err
 }
 
-// InsertClip inserta un clip procesado.
+// InsertClip inserta un clip procesado (status 'completed' por convención del caller).
+// Devuelve el ID generado en c.ID. Igual que InsertVideo: el UNIQUE(filepath) hace
+// que un reintento duplicado falle y el caller reuse la fila existente.
 func InsertClip(db *sql.DB, c *Clip) error {
 	res, err := db.Exec(
 		`INSERT INTO clips (video_id, start_time_seconds, end_time_seconds, filepath, thumbnail_path, duration_seconds, width, height, status, created_at, updated_at)
@@ -554,7 +561,9 @@ func UpdateClipStatus(db *sql.DB, id int64, status, errorMessage string) error {
 	return err
 }
 
-// InsertPublication inserta una nueva publicación pendiente.
+// InsertPublication inserta una nueva publicación pendiente ('pending' por convención
+// del caller). UNIQUE (clip_id, platform): un segundo INSERT para la misma
+// combinación falla — el operador decide si reusar la fila o borrarla.
 func InsertPublication(db *sql.DB, p *Publication) error {
 	// convertir next_retry_at a RFC3339 para comparaciones lexicográficas consistentes en SQL
 	var nextRetryStr interface{}
@@ -691,11 +700,11 @@ func GetClipByPublication(db *sql.DB, publicationID int64) (*Clip, error) {
 // GetPendingJobs devuelve jobs disponibles para procesar, más viejos primero.
 //
 // Dos condiciones para ofrecer un job:
-//   1. status = 'queued' (nadie lo está ejecutando), o
-//   2. locked_at tiene más de 30 segundos: el worker que lo tomó murió y el job
-//      se considera huérfano (stale lock). Con el umbral en RFC3339, la comparación
-//      es lexicográfica y correcta; NO usar datetime(locked_at) porque ese formato
-//      no coincide con el texto que guardamos (ver cabecera de migrations.go).
+//  1. status = 'queued' (nadie lo está ejecutando), o
+//  2. locked_at tiene más de 30 segundos: el worker que lo tomó murió y el job
+//     se considera huérfano (stale lock). Con el umbral en RFC3339, la comparación
+//     es lexicográfica y correcta; NO usar datetime(locked_at) porque ese formato
+//     no coincide con el texto que guardamos (ver cabecera de migrations.go).
 func GetPendingJobs(db *sql.DB, limit int) ([]Job, error) {
 	rows, err := db.Query(
 		`SELECT id, type, reference_id, reference_type, status, attempts, locked_at, locked_by, error_message, created_at, updated_at
@@ -753,7 +762,7 @@ func LockJob(db *sql.DB, id int64, workerID string) error {
 	return nil
 }
 
-// CompleteJob marca un job como done.
+// CompleteJob marca un job como done (fin exitoso del handler).
 func CompleteJob(db *sql.DB, id int64) error {
 	_, err := db.Exec(
 		`UPDATE jobs SET status = 'done', updated_at = ? WHERE id = ?`,
@@ -771,7 +780,9 @@ func FailJob(db *sql.DB, id int64, errorMessage string) error {
 	return err
 }
 
-// EnqueueJob inserta un nuevo job en la cola.
+// EnqueueJob inserta un nuevo job en la cola (status 'queued').
+// Devuelve el ID generado en j.ID, útil para loguear la cadena de jobs
+// (discovery → download → process → thumbnail → publish).
 func EnqueueJob(db *sql.DB, j *Job) error {
 	res, err := db.Exec(
 		`INSERT INTO jobs (type, reference_id, reference_type, status, created_at, updated_at)

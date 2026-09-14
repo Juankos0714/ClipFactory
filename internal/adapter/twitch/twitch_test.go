@@ -1,5 +1,9 @@
 package twitch
 
+// Tests del TwitchAdapter contra un httptest.Server: validación de credenciales,
+// construcción del request Helix (headers Client-ID/Authorization, query params)
+// y manejo de errores HTTP.
+
 import (
 	"context"
 	"encoding/json"

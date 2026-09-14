@@ -1,5 +1,8 @@
 package config
 
+// Tests de la carga de configuración: defaults por env var, parsing de
+// credentials/twitch.conf y tolerancia a archivos faltantes.
+
 import (
 	"os"
 	"path/filepath"

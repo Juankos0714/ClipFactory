@@ -1,5 +1,9 @@
 package db
 
+// Tests del CRUD tipado de models.go: inserts, búsquedas por ID/filepath,
+// upserts idempotentes y constraints UNIQUE. Todos usan una DB :memory:
+// compartida creada por setupTestDB.
+
 import (
 	"database/sql"
 	"testing"
@@ -30,10 +34,10 @@ func TestInsertSource(t *testing.T) {
 	defer db.Close()
 
 	source := &Source{
-		Platform:      "twitch",
-		ChannelID:     "12345",
-		ChannelName:   "test_channel",
-		Active:        true,
+		Platform:    "twitch",
+		ChannelID:   "12345",
+		ChannelName: "test_channel",
+		Active:      true,
 	}
 
 	if err := InsertSource(db, source); err != nil {
@@ -137,14 +141,14 @@ func TestUpsertSourceClip(t *testing.T) {
 
 	// crear source clip
 	clip := &SourceClip{
-		Platform:          "twitch",
-		PlatformClipID:    "clip123",
-		SourceID:          source.ID,
-		Title:             "Test Clip",
-		DurationSeconds:   60.0,
-		Status:            "detected",
-		CreatedAt:         time.Now().UTC(),
-		UpdatedAt:         time.Now().UTC(),
+		Platform:        "twitch",
+		PlatformClipID:  "clip123",
+		SourceID:        source.ID,
+		Title:           "Test Clip",
+		DurationSeconds: 60.0,
+		Status:          "detected",
+		CreatedAt:       time.Now().UTC(),
+		UpdatedAt:       time.Now().UTC(),
 	}
 
 	// primera inserción
@@ -158,13 +162,13 @@ func TestUpsertSourceClip(t *testing.T) {
 
 	// segunda inserción (debe ser idempotente)
 	clip2 := &SourceClip{
-		Platform:          "twitch",
-		PlatformClipID:    "clip123",
-		SourceID:          source.ID,
-		Title:             "Different Title",
-		Status:            "downloaded",
-		CreatedAt:         time.Now().UTC(),
-		UpdatedAt:         time.Now().UTC(),
+		Platform:       "twitch",
+		PlatformClipID: "clip123",
+		SourceID:       source.ID,
+		Title:          "Different Title",
+		Status:         "downloaded",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
 	}
 
 	if err := UpsertSourceClip(db, clip2); err != nil {
@@ -205,12 +209,12 @@ func TestInsertVideo(t *testing.T) {
 	}
 
 	clip := &SourceClip{
-		Platform:        "twitch",
-		PlatformClipID:  "clip123",
-		SourceID:        source.ID,
-		Status:          "downloaded",
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		Platform:       "twitch",
+		PlatformClipID: "clip123",
+		SourceID:       source.ID,
+		Status:         "downloaded",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
 	}
 	if err := UpsertSourceClip(db, clip); err != nil {
 		t.Fatalf("upsert source clip: %v", err)
@@ -223,7 +227,7 @@ func TestInsertVideo(t *testing.T) {
 		DurationSeconds: 60.0,
 		Width:           1920,
 		Height:          1080,
-		Status:           "incoming",
+		Status:          "incoming",
 		CreatedAt:       time.Now().UTC(),
 		UpdatedAt:       time.Now().UTC(),
 	}
@@ -274,20 +278,20 @@ func TestGetVideoByFilepath(t *testing.T) {
 		t.Fatalf("insert source: %v", err)
 	}
 	clip := &SourceClip{
-		Platform:        "twitch",
-		PlatformClipID:  "clip123",
-		SourceID:        source.ID,
-		Status:          "downloaded",
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		Platform:       "twitch",
+		PlatformClipID: "clip123",
+		SourceID:       source.ID,
+		Status:         "downloaded",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
 	}
 	if err := UpsertSourceClip(db, clip); err != nil {
 		t.Fatalf("upsert source clip: %v", err)
 	}
 	video := &Video{
 		SourceClipID: clip.ID,
-		Filepath:      "/tmp/test.mp4",
-		Status:        "incoming",
+		Filepath:     "/tmp/test.mp4",
+		Status:       "incoming",
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
@@ -342,20 +346,20 @@ func TestUpdateVideoStatus(t *testing.T) {
 		t.Fatalf("insert source: %v", err)
 	}
 	clip := &SourceClip{
-		Platform:        "twitch",
-		PlatformClipID:  "clip123",
-		SourceID:        source.ID,
-		Status:          "downloaded",
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		Platform:       "twitch",
+		PlatformClipID: "clip123",
+		SourceID:       source.ID,
+		Status:         "downloaded",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
 	}
 	if err := UpsertSourceClip(db, clip); err != nil {
 		t.Fatalf("upsert source clip: %v", err)
 	}
 	video := &Video{
 		SourceClipID: clip.ID,
-		Filepath:      "/tmp/test.mp4",
-		Status:        "incoming",
+		Filepath:     "/tmp/test.mp4",
+		Status:       "incoming",
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
@@ -397,20 +401,20 @@ func TestInsertClip(t *testing.T) {
 		t.Fatalf("insert source: %v", err)
 	}
 	clip := &SourceClip{
-		Platform:        "twitch",
-		PlatformClipID:  "clip123",
-		SourceID:        source.ID,
-		Status:          "downloaded",
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		Platform:       "twitch",
+		PlatformClipID: "clip123",
+		SourceID:       source.ID,
+		Status:         "downloaded",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
 	}
 	if err := UpsertSourceClip(db, clip); err != nil {
 		t.Fatalf("upsert source clip: %v", err)
 	}
 	video := &Video{
 		SourceClipID: clip.ID,
-		Filepath:      "/tmp/test.mp4",
-		Status:        "completed",
+		Filepath:     "/tmp/test.mp4",
+		Status:       "completed",
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
@@ -420,16 +424,16 @@ func TestInsertClip(t *testing.T) {
 
 	// insertar clip
 	c := &Clip{
-		VideoID:       video.ID,
-		StartTimeSec:  10.0,
-		EndTimeSec:    40.0,
-		Filepath:      "/tmp/clip.mp4",
-		DurationSec:   30.0,
-		Width:         1080,
-		Height:        1920,
-		Status:        "completed",
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
+		VideoID:      video.ID,
+		StartTimeSec: 10.0,
+		EndTimeSec:   40.0,
+		Filepath:     "/tmp/clip.mp4",
+		DurationSec:  30.0,
+		Width:        1080,
+		Height:       1920,
+		Status:       "completed",
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
 	}
 
 	if err := InsertClip(db, c); err != nil {
@@ -485,20 +489,20 @@ func TestInsertPublication(t *testing.T) {
 		t.Fatalf("insert source: %v", err)
 	}
 	clip := &SourceClip{
-		Platform:        "twitch",
-		PlatformClipID:  "clip123",
-		SourceID:        source.ID,
-		Status:          "downloaded",
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		Platform:       "twitch",
+		PlatformClipID: "clip123",
+		SourceID:       source.ID,
+		Status:         "downloaded",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
 	}
 	if err := UpsertSourceClip(db, clip); err != nil {
 		t.Fatalf("upsert source clip: %v", err)
 	}
 	video := &Video{
 		SourceClipID: clip.ID,
-		Filepath:      "/tmp/test.mp4",
-		Status:        "completed",
+		Filepath:     "/tmp/test.mp4",
+		Status:       "completed",
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
@@ -520,9 +524,9 @@ func TestInsertPublication(t *testing.T) {
 
 	// insertar publicación
 	p := &Publication{
-		ClipID:   c.ID,
-		Platform: "youtube",
-		Status:   "pending",
+		ClipID:    c.ID,
+		Platform:  "youtube",
+		Status:    "pending",
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -572,20 +576,20 @@ func TestGetPendingPublications(t *testing.T) {
 		t.Fatalf("insert source: %v", err)
 	}
 	sc := &SourceClip{
-		Platform:        "twitch",
-		PlatformClipID:  "clip123",
-		SourceID:        source.ID,
-		Status:          "downloaded",
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		Platform:       "twitch",
+		PlatformClipID: "clip123",
+		SourceID:       source.ID,
+		Status:         "downloaded",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
 	}
 	if err := UpsertSourceClip(db, sc); err != nil {
 		t.Fatalf("upsert source clip: %v", err)
 	}
 	v := &Video{
 		SourceClipID: sc.ID,
-		Filepath:      "/tmp/test.mp4",
-		Status:        "completed",
+		Filepath:     "/tmp/test.mp4",
+		Status:       "completed",
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
@@ -620,9 +624,9 @@ func TestGetPendingPublications(t *testing.T) {
 	}
 
 	p1 := &Publication{
-		ClipID:   c.ID,
-		Platform: "youtube",
-		Status:   "pending",
+		ClipID:    c.ID,
+		Platform:  "youtube",
+		Status:    "pending",
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -630,9 +634,9 @@ func TestGetPendingPublications(t *testing.T) {
 		t.Fatalf("insert publication 1: %v", err)
 	}
 	p2 := &Publication{
-		ClipID:   c2.ID,
-		Platform: "youtube",
-		Status:   "error",
+		ClipID:    c2.ID,
+		Platform:  "youtube",
+		Status:    "error",
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -640,9 +644,9 @@ func TestGetPendingPublications(t *testing.T) {
 		t.Fatalf("insert publication 2: %v", err)
 	}
 	p3 := &Publication{
-		ClipID:   c.ID,
-		Platform: "meta",
-		Status:   "pending",
+		ClipID:    c.ID,
+		Platform:  "meta",
+		Status:    "pending",
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -896,9 +900,9 @@ func TestInsertLog(t *testing.T) {
 
 	// insertar un log
 	logEntry := &Log{
-		Level:   "info",
-		Module:  "worker",
-		Message: "test log message",
+		Level:     "info",
+		Module:    "worker",
+		Message:   "test log message",
 		CreatedAt: time.Now().UTC(),
 	}
 
@@ -951,4 +955,3 @@ func TestNowUTC(t *testing.T) {
 		t.Errorf("expected recent timestamp, got %v", parsed)
 	}
 }
-
