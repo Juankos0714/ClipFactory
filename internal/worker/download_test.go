@@ -278,7 +278,15 @@ func TestExecuteDownloadNoDownloaderConfigured(t *testing.T) {
 		t.Fatalf("create worker: %v", err)
 	}
 
-	job := &db.Job{Type: "download", ReferenceID: 1, ReferenceType: "source_clips"}
+	// source_clip de prueba (antes del multi-plataforma el job fallaba antes de
+	// cargar el clip; ahora la resolución del downloader es por sc.Platform y
+	// necesita la fila para saber la plataforma)
+	sc := &db.SourceClip{Platform: "twitch", PlatformClipID: "nodl-clip", Status: "detected"}
+	if err := db.UpsertSourceClip(w.db, sc); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	job := &db.Job{Type: "download", ReferenceID: sc.ID, ReferenceType: "source_clips"}
 	err = w.executeDownload(context.Background(), *job)
 	if err == nil {
 		t.Fatal("expected error when no downloader is configured, got nil")

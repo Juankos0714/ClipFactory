@@ -85,8 +85,8 @@ func TestInitDB(t *testing.T) {
 	if err != nil {
 		t.Errorf("error counting tables: %v", err)
 	}
-	if count != 7 {
-		t.Errorf("expected 7 tables, got %d", count)
+	if count != 8 {
+		t.Errorf("expected 8 tables (7 de negocio + schema_migrations), got %d", count)
 	}
 }
 
@@ -111,7 +111,7 @@ func TestMigrateDBIdempotency(t *testing.T) {
 	if err != nil {
 		t.Errorf("error counting tables: %v", err)
 	}
-	if count != 7 {
-		t.Errorf("expected 7 tables, got %d", count)
+	if count != 8 {
+		t.Errorf("expected 8 tables (7 de negocio + schema_migrations), got %d", count)
 	}
 }

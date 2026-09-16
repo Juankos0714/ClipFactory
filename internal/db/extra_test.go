@@ -279,6 +279,55 @@ func TestGetPendingJobsStaleLock(t *testing.T) {
 	}
 }
 
+// TestGetPendingJobsFutureCreatedAt: un job 'queued' con created_at FUTURO no
+// se ofrece todavía (mecanismo de backoff de requeuePublish: el job duerme hasta
+// su hora). Cuando la hora llega, GetPendingJobs lo devuelve.
+func TestGetPendingJobsFutureCreatedAt(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	// encolar directo con created_at futuro (como hace requeuePublish)
+	future := time.Now().UTC().Add(1 * time.Hour).Format(time.RFC3339)
+	res, err := db.Exec(
+		`INSERT INTO jobs (type, reference_id, reference_type, status, created_at, updated_at)
+		 VALUES ('publish', 1, 'publications', 'queued', ?, ?)`,
+		future, NowUTC(),
+	)
+	if err != nil {
+		t.Fatalf("insert future job: %v", err)
+	}
+	jobID, _ := res.LastInsertId()
+
+	// y uno normal (created_at = now): este SÍ debe salir
+	jNow := &Job{Type: "publish", ReferenceID: 2, ReferenceType: "publications"}
+	if err := EnqueueJob(db, jNow); err != nil {
+		t.Fatalf("enqueue now job: %v", err)
+	}
+
+	jobs, err := GetPendingJobs(db, 10)
+	if err != nil {
+		t.Fatalf("get pending jobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected only the now-job, got %d jobs", len(jobs))
+	}
+	if jobs[0].ID != jNow.ID {
+		t.Errorf("expected job %d (now), got job %d", jNow.ID, jobs[0].ID)
+	}
+
+	// la hora del job futuro llega: ahora sí se ofrece
+	if _, err := db.Exec(`UPDATE jobs SET created_at = ? WHERE id = ?`, NowUTC(), jobID); err != nil {
+		t.Fatalf("backdate created_at: %v", err)
+	}
+	jobs, err = GetPendingJobs(db, 10)
+	if err != nil {
+		t.Fatalf("get pending jobs (2): %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Errorf("expected 2 jobs once future job is due, got %d", len(jobs))
+	}
+}
+
 // ---- CleanupOldCompletedVideos ----
 
 func TestCleanupOldCompletedVideos(t *testing.T) {

@@ -86,7 +86,8 @@ proceso con estado, auditable y reanudable tras fallos.
 | `download` | discovery | `source_clips` | 1 job `process` |
 | `process` | download | `videos` | 1 job `thumbnail` |
 | `thumbnail` | process | `clips` | — (fin de cadena) |
-| `publish` | operador/futuro job de encabezado | `publications` | — |
+| `publish` | operador, poll_publications, o el propio publish (reintento) | `publications` | job futuro en error/cuota (created_at = next_retry_at) |
+| `poll_publications` | el worker cada `PollPublicationsInterval` (5m) | `system` | N jobs `publish` (publications pendientes sin job en vuelo) |
 
 El `reference_id` + `reference_type` del job es un puntero polimórfico a la
 tabla que contiene los datos del trabajo. Es más simple que una tabla de
@@ -114,7 +115,7 @@ el job falla con mensaje claro).
 - **Goroutines para concurrencia barata**: el worker lanza cada job en su
   goroutine; el coste de las 2 concurrentes es despreciable.
 - **`database/sql` estándar**: la capa DB es SQL plano con helpers tipados
-  (ver `internal/db/models.go`), sin ORM. Con 7 tablas y ~20 queries, un ORM
+  (ver `internal/db/models.go`), sin ORM. Con 8 tablas y ~20 queries, un ORM
   (GORM, ent) añadiría dependencias y reflection sin ganar nada.
 - Alternativa descartada: **Python** (ecosistema de video YouTube API más
   maduro, pero distribución mucho más frágil en un servidor personal y sin
@@ -332,9 +333,11 @@ Notas finas:
 - `publications: waiting_rate_limit` NO incrementa `attempts` — la cuota de
   YouTube agotada no es culpa del clip; el backoff exponencial queda reservado
   para fallos reales del pipeline.
-- `jobs` en `error` NO se re-encolan automáticamente (los reintentos naturales
-  del publish los hace `GetPendingPublications` por `next_retry_at`); los
-  demás se re-encolan a mano insertando un job nuevo (idempotente por diseño).
+- `jobs` en `error` NO se re-encolan automáticamente: el reintento de las
+  publications lo hacen (1) el job futuro que `executePublish` encola con
+  `created_at = next_retry_at` y (2) el `poll_publications` periódico como red
+  de seguridad. Los demás jobs se re-encolan a mano insertando un job nuevo
+  (idempotente por diseño).
 
 ## 5. Manejo de errores y reintentos
 
@@ -347,9 +350,11 @@ Principio: **fallar temprano en arranque, fallar suave en runtime**.
   en job `error`, no en proceso muerto) y sigue con la cola.
 - Backoff de publicaciones: `next_retry_at = now · 2^attempts` con cap de 24h
   (1h, 2h, 4h...). `GetPendingPublications` solo devuelve filas cuyo
-  `next_retry_at` ya venció → los reintentos son naturales, sin timers.
-- Errores clasificados: cuota (`RateLimitError`) → esperar reset diario; el
-  resto → backoff exponencial.
+  `next_retry_at` ya venció → los reintentos son naturales, sin timers. Además,
+  `executePublish` re-encola el job con `created_at = next_retry_at`: el job
+  no se ofrece hasta vencer el backoff (scheduling por tiempo de creación).
+- Errores clasificados: cuota (`RateLimitError`, YouTube y Meta) → esperar
+  reset diario (YouTube) / backoff (Meta); el resto → backoff exponencial.
 - `error_message` en cada tabla guarda el detalle (con stderr recortado de los
   subprocess) para diagnosticar sin logs adicionales.
 
@@ -378,24 +383,70 @@ Principio: **fallar temprano en arranque, fallar suave en runtime**.
 
 ## 8. Limitaciones conocidas y roadmap
 
-- **`sources.yaml` sin implementar**: los canales se insertan directo en la
-  tabla `sources` con sqlite3 (ver Guía de Uso §7).
-- **`GetChannelIDByName` incompleto**: hace el request pero no parsea el JSON
+- **`sources.yaml` implementado** ✅: los canales se configuran en
+  `config/sources.yaml` y se aplican a la tabla `sources` en cada arranque
+  (upsert idempotente por `UpsertSource`). Los canales existentes en la DB que
+  no están en el archivo no se tocan (el archivo da de alta, no excluye).
+- **Auto-discovery al arrancar** ✅: el worker encola un job `discovery` por
+  cada canal activo en su primer tick (`DiscoverOnStart`, default true;
+  `CLIPFACTORY_DISCOVER_ON_START=false` para desactivar). UNA vez por proceso:
+  si un discovery falla, el reintento lo maneja el operador (CLI `discovery`) o
+  el próximo arranque, no hay spam automático de jobs en error.
+- **Shutdown graceful** ✅: SIGINT/SIGTERM (Ctrl+C, `docker stop`) cancelan el
+  contexto del worker: los jobs en curso abortan sus HTTP/ffmpeg (todos los
+  adaptadores son context-aware) y se RE-ENCOLAN ('queued', sin error) para el
+  próximo arranque en vez de marcarse fallidos. `docker stop` sale con code 0.
+  Los jobs 'running' huérfanos (kill -9, corte de luz) se recuperan por el
+  stale-lock de 30s, que ahora también aplica sobre jobs en 'running'
+  (`GetPendingJobs` + `LockJob`). Una segunda señal fuerza la salida (exit 130).
+- **GetChannelIDByName incompleto**: hace el request pero no parsea el JSON
   todavía; se usa el curl documentado en la Guía de Twitch §6.
-- **`status` y `discovery` CLI mínimos**: status no lee la DB; la pasada manual
-  de discovery es insertando un job.
-- **Re-encolado de publications tras error/cuota**: hoy el job `publish` es de
-  un tiro; el reintento natural lo hace `GetPendingPublications`, pero falta un
-  mecanismo que encole los publishes pendientes periódicamente.
-- **Sin versionado de migraciones**: `MigrateDB` es idempotente con
-  `CREATE TABLE IF NOT EXISTS`; cuando el esquema necesite cambios destructivos
-  se agregará `schema_migrations`.
+- **`status` CLI implementado** ✅: lee la DB real y reporta versión de
+  esquema, jobs por tipo/estado, videos/clips por estado, source_clips y
+  publications por plataforma (backend: `db.GetJobStats` y compañía en
+  `internal/db/stats.go`).
+- **`discovery` CLI implementado** ✅: encola un job discovery por cada canal
+  activo usando `EnsureActiveJob` (idempotente: no duplica si ya hay uno en
+  vuelo) tras aplicar sources.yaml. El worker es quien ejecuta la pasada; de
+  hecho, con el auto-discovery al arrancar (ver arriba) normalmente ni hace
+  falta invocarlo.
+- **Re-encolado de publications implementado** ✅: dos mecanismos
+  complementarios: (1) `executePublish` programa el siguiente intento encolando
+  un job `publish` con `created_at = next_retry_at` (el scheduler solo ofrece
+  jobs con `created_at <= now`, así que el job "duerme" hasta vencer el backoff
+  o el reset de cuota); (2) el job `poll_publications` (encolado cada
+  `CLIPFACTORY_POLL_PUBLICATIONS_INTERVAL`, default 5m) re-encola publishes de
+  publications pendientes que quedaron sin job futuro (p.ej. tras un crash).
+- **Versionado de migraciones implementado** ✅: tabla `schema_migrations`
+  (version, name, applied_at). Cada paso vive en `migrationSteps` con versión
+  consecutiva; `MigrateDB` ejecuta solo las faltantes, cada una en una
+  transacción. Las DBs creadas antes del versionado se adoptan: la v1 se
+  registra como aplicada sin re-ejecutar el DDL (ver `adoptLegacySchema`).
+- **Meta (Facebook) implementado** ✅: Reels de página vía Graph API
+  (`internal/adapter/meta`), con upload multipart o `file_url` (si se configura
+  `SetFilesBaseURL`) y clasificación de rate limit (códigos 4/17/32/613) para
+  el mismo backoff del worker. Kick es plataforma de ORIGEN (como Twitch), no
+  de publicación.
 - **Título de video genérico**: `Clip <archivo>`; enriquecerlo con streamer/
   juego requiere guardar más campos de Helix en `source_clips`.
-- **Meta/TikTok/Kick**: la arquitectura los espera (un Publisher cada uno),
-  pero no hay implementación.
+- **TikTok**: publicación pendiente (la arquitectura lo espera: es agregar un
+  Publisher al mapa `Publishers` del worker).
 - **`logs` table infrautilizada**: el esquema la define; hoy el logging real
   va a stdout/logs de archivos.
+- **API de Kick no oficial**: los endpoints de clips de kick.com funcionan pero
+  no están documentados ni soportados; pueden cambiar sin aviso (todos los
+  endpoints del adapter son sobrescribibles para absorber cambios).
+- **`GetChannelIDByName` incompleto**: hace el request pero no parsea el JSON
+  todavía; se usa el curl documentado en la Guía de Twitch §6.
+- **`status` CLI implementado** ✅: lee la DB real y reporta versión de
+  esquema, jobs por tipo/estado, videos/clips por estado, source_clips y
+  publications por plataforma (backend: `db.GetJobStats` y compañía en
+  `internal/db/stats.go`).
+- **`discovery` CLI implementado** ✅: encola un job discovery por cada canal
+  activo usando `EnsureActiveJob` (idempotente: no duplica si ya hay uno en
+  vuelo) tras aplicar sources.yaml. El worker es quien ejecuta la pasada; de
+  hecho, con el auto-discovery al arrancar (ver arriba) normalmente ni hace
+  falta invocarlo.
 
 ---
 

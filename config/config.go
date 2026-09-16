@@ -10,7 +10,9 @@
 //     estilo .env con las credenciales por plataforma. Formato documentado en
 //     docs/guia-twitch.md y docs/guia-youtube.md.
 //
-//  3. config/sources.yaml (FUTURO): canales a monitorear. loadSources es un stub.
+//  3. config/sources.yaml: canales a monitorear (Twitch/Kick). El worker lo aplica
+//     a la tabla `sources` en cada arranque (upsert idempotente), así que editar el
+//     archivo y reiniciar es suficiente para dar de alta o pausar canales.
 //
 // Las credenciales viven separadas de la config para poder montar credentials/ con
 // permisos restringidos (y para no commitear nunca secretos: credentials/ está
@@ -46,13 +48,27 @@ type Config struct {
 	MaxConcurrentJobs int           // jobs en paralelo (default: NumCPU)
 	PollInterval      time.Duration // frecuencia de sondeo de la cola (default: 5s)
 
-	// Sources: canales a monitorear (hoy siempre vacío: loadSources es stub)
+	// Sources: canales a monitorear, cargados de config/sources.yaml (vacío si
+	// el archivo no existe: los canales también pueden administrarse por DB)
 	Sources []SourceConfig
+
+	// Intervalo entre corridas del job poll_publications, que re-encola los
+	// publishes de publications pendientes (reintentos tras error/cuota).
+	// Default: 5m (ver CLIPFACTORY_POLL_PUBLICATIONS_INTERVAL).
+	PollPublicationsInterval time.Duration
+
+	// DiscoverOnStart: auto-discovery al arrancar el worker — encola un job
+	// 'discovery' por cada canal activo de la tabla sources en el primer tick
+	// (idempotente vía EnsureActiveJob). Default true;
+	// CLIPFACTORY_DISCOVER_ON_START=false para desactivarlo.
+	DiscoverOnStart bool
 
 	// Platform credentials (cargadas desde archivos en credentials/)
 	Twitch  TwitchConfig
 	YouTube YouTubeConfig
-	// Meta, TikTok, Kick se agregan en fases posteriores
+	Meta    MetaConfig
+	// TikTok y publicación en Kick se agregan en fases posteriores (Kick es
+	// plataforma de ORIGEN de clips, como Twitch)
 
 	// Ruta al binario TwitchDownloaderCLI (para el job 'download').
 	// Default: "TwitchDownloaderCLI" (se asume en PATH; la imagen Docker lo incluye).
@@ -69,6 +85,14 @@ type SourceConfig struct {
 	ChannelID   string // ID de canal en la plataforma
 	ChannelName string // nombre legible (para logs y display)
 	Active      bool   // monitorear o no
+}
+
+// MetaConfig representa las credenciales de Meta/Facebook
+// (credentials/meta.conf) para publicar los clips como Reels en una página.
+type MetaConfig struct {
+	PageID       string // ID de la página de Facebook donde se publican los Reels
+	AccessToken  string // Page Access Token (no el token de usuario: ver docs)
+	GraphVersion string // versión de la Graph API (default "v21.0")
 }
 
 // TwitchConfig representa las credenciales de Twitch (credentials/twitch.conf).
@@ -109,6 +133,11 @@ func LoadConfig() (*Config, error) {
 		TwitchDownloaderPath: getEnv("CLIPFACTORY_TWITCH_DOWNLOADER_PATH", "TwitchDownloaderCLI"),
 		FFmpegPath:           getEnv("CLIPFACTORY_FFMPEG_PATH", "ffmpeg"),
 	}
+	// intervalo del poll de publications (re-encolado automático de publishes)
+	cfg.PollPublicationsInterval = getEnvDuration("CLIPFACTORY_POLL_PUBLICATIONS_INTERVAL", "5m")
+
+	// auto-discovery al arrancar el worker ("true"/"1"/"yes"; default true)
+	cfg.DiscoverOnStart = getEnvBool("CLIPFACTORY_DISCOVER_ON_START", true)
 
 	// 2) sources.yaml (canales a monitorear) — opcional, stub hoy
 	sources, err := loadSources(filepath.Join(cfg.ConfigDir, "sources.yaml"))
@@ -131,16 +160,197 @@ func LoadConfig() (*Config, error) {
 	}
 	cfg.YouTube = ytCfg
 
+	// 5) credentials/meta.conf — opcional (publicación en Facebook Reels)
+	metaCfg, err := loadMetaConfig(filepath.Join(cfg.CredentialsDir, "meta.conf"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("load meta config: %w", err)
+	}
+	cfg.Meta = metaCfg
+
 	return cfg, nil
 }
 
-// loadSources carga los canales a monitorear desde config/sources.yaml.
+// stripInlineComment corta un comentario inline de un valor de configuración:
+// todo desde ` #` (espacio + numeral) hasta el fin de línea. Misma semántica
+// que YAML: un `#` PEGADO al texto no es comentario (p.ej. "C#", "#1"), y un
+// valor entre comillas se respeta íntegro (las comillas se quitan aparte).
 //
-// TODO: implementar lectura de YAML/JSON de fuentes.
-// Por ahora retorna nil (sin canales): los canales se insertan directo en la
-// tabla `sources` de la DB (ver docs/guia-twitch.md §9).
+// Sin esto, `active: false # pausado` fallaba con "active inválido" — un error
+// que el sistema-test en vivo encontró en el primer walkthrough.
+func stripInlineComment(value string) string {
+	v := strings.TrimSpace(value)
+	if strings.HasPrefix(v, "\"") || strings.HasPrefix(v, "'") {
+		return v // valor citado: se respeta completo
+	}
+	// cortar en el primer '#' precedido de espacio o tab (espacio en blanco
+	// antes del # = comentario; pegado al texto = parte del valor)
+	if idx := strings.IndexAny(v, " \t"); idx >= 0 {
+		if rest := strings.TrimSpace(v[idx+1:]); strings.HasPrefix(rest, "#") {
+			v = strings.TrimSpace(v[:idx])
+		}
+	}
+	return v
+}
+
+// loadSources lee los canales a monitorear desde config/sources.yaml.
+//
+// El archivo usa un SUBCONJUNTO mínimo de YAML, parseado a mano (sin
+// dependencias externas, igual que los .conf). Formato:
+//
+//	sources:
+//	  - platform: twitch
+//	    channel_id: "4919"       # broadcaster ID numérico (Guía de Twitch §6)
+//	    channel_name: illojuan
+//	    active: true
+//	  - platform: kick
+//	    channel_id: "illojuan"   # slug del canal en kick.com
+//	    channel_name: illojuan (kick)
+//	    # active default: true
+//
+// Reglas del parser:
+//   - ignora líneas vacías y comentarios (# de línea completa)
+//   - comentarios INLINE: ` #...` en un valor se corta (fuera de comillas,
+//     ver stripInlineComment); "valor # citado" se preserva
+//   - la lista vive bajo la clave `sources:`; cada ítem empieza con `- `
+//     (puede ser `- key: value` con la primera clave en la misma línea)
+//   - claves reconocidas por ítem: platform, channel_id, channel_name, active
+//   - channel_id se lee SIEMPRE como string (los IDs de Twitch son numéricos,
+//     pero se preservan tal cual; entre comillas o no)
+//   - active acepta true/false (default true)
+//
+// Es estricto a propósito: un sources.yaml con un ítem sin platform/channel_id,
+// una plataforma desconocida o contenido fuera de la lista `sources` es ERROR
+// (el archivo existe = el operador quiso configurar algo: mejor fallar al
+// arrancar que ignorar canales silenciosamente).
 func loadSources(path string) ([]SourceConfig, error) {
-	return nil, nil
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var sources []SourceConfig
+	var current *SourceConfig
+	inSources := false
+
+	for lineNum, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// clave de primer nivel: termina/reinicia la lista
+		if !strings.HasPrefix(line, "-") && !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t") {
+			if strings.HasSuffix(line, ":") {
+				inSources = strings.TrimSuffix(line, ":") == "sources"
+				current = nil
+				continue
+			}
+			return nil, fmt.Errorf("%s línea %d: contenido inesperado %q (solo se admite la lista 'sources:')", path, lineNum+1, line)
+		}
+		if !inSources {
+			return nil, fmt.Errorf("%s línea %d: contenido fuera de 'sources:' %q", path, lineNum+1, line)
+		}
+
+		// nuevo ítem de la lista
+		if strings.HasPrefix(line, "-") {
+			rest := strings.TrimSpace(strings.TrimPrefix(line, "-"))
+			sources = append(sources, SourceConfig{Active: true}) // default
+			current = &sources[len(sources)-1]
+			if rest == "" {
+				continue
+			}
+			line = rest // `- key: value` → procesar la clave en la misma línea
+		}
+
+		// clave: valor dentro del ítem actual
+		if current == nil {
+			return nil, fmt.Errorf("%s línea %d: clave %q sin ítem (-) previo", path, lineNum+1, line)
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("%s línea %d: se esperaba 'clave: valor', got %q", path, lineNum+1, line)
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.Trim(stripInlineComment(parts[1]), `"`)
+		switch key {
+		case "platform":
+			current.Platform = value
+		case "channel_id":
+			current.ChannelID = value
+		case "channel_name":
+			current.ChannelName = value
+		case "active":
+			switch strings.ToLower(value) {
+			case "true", "1", "yes", "":
+				current.Active = true
+			case "false", "0", "no":
+				current.Active = false
+			default:
+				return nil, fmt.Errorf("%s línea %d: active inválido %q (usar true/false)", path, lineNum+1, value)
+			}
+		default:
+			return nil, fmt.Errorf("%s línea %d: clave desconocida %q (soportadas: platform, channel_id, channel_name, active)", path, lineNum+1, key)
+		}
+	}
+
+	// validación por ítem: lo mínimo para que el discovery funcione
+	for i, s := range sources {
+		if s.Platform == "" || s.ChannelID == "" {
+			return nil, fmt.Errorf("%s: sources[%d] necesita 'platform' y 'channel_id'", path, i)
+		}
+		switch s.Platform {
+		case "twitch", "kick":
+			// ok
+		default:
+			return nil, fmt.Errorf("%s: sources[%d] plataforma desconocida %q (soportadas: twitch, kick)", path, i, s.Platform)
+		}
+		if s.ChannelName == "" {
+			sources[i].ChannelName = s.ChannelID // nombre legible por defecto
+		}
+	}
+	return sources, nil
+}
+
+// loadMetaConfig lee credentials/meta.conf (mismo formato clave=valor que
+// twitch.conf/youtube.conf).
+//
+// Claves reconocidas:
+//
+//	PAGE_ID, ACCESS_TOKEN (obligatorios para publicar)
+//	GRAPH_API_VERSION (default "v21.0")
+func loadMetaConfig(path string) (MetaConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return MetaConfig{}, err
+	}
+
+	cfg := MetaConfig{}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := stripInlineComment(parts[1])
+		switch key {
+		case "PAGE_ID":
+			cfg.PageID = value
+		case "ACCESS_TOKEN":
+			cfg.AccessToken = value
+		case "GRAPH_API_VERSION":
+			cfg.GraphVersion = value
+		}
+	}
+
+	if cfg.GraphVersion == "" {
+		cfg.GraphVersion = "v21.0"
+	}
+	return cfg, nil
 }
 
 // loadTwitchConfig lee un archivo clave=valor (estilo .env).
@@ -174,7 +384,7 @@ func loadTwitchConfig(path string) (TwitchConfig, error) {
 			continue // línea sin '=' → ignorar
 		}
 		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
+		value := stripInlineComment(parts[1])
 		switch key {
 		case "CLIENT_ID":
 			cfg.ClientID = value
@@ -212,7 +422,7 @@ func loadYouTubeConfig(path string) (YouTubeConfig, error) {
 			continue
 		}
 		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
+		value := stripInlineComment(parts[1])
 		switch key {
 		case "CLIENT_ID":
 			cfg.ClientID = value
@@ -241,6 +451,22 @@ func loadYouTubeConfig(path string) (YouTubeConfig, error) {
 func getEnv(key, defaultValue string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return defaultValue
+}
+
+// getEnvBool lee una variable de entorno como bool: "true", "1" y "yes" (en
+// cualquier combinación de mayúsculas/minúsculas) son true; "false", "0" y
+// "no" son false; cualquier otra cosa (incluido vacío/no existir) devuelve el
+// default. Un valor no reconocido NO es error: se usa el default (misma
+// tolerancia que getEnvInt/getEnvDuration).
+func getEnvBool(key string, defaultValue bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "true", "1", "yes":
+		return true
+	case "false", "0", "no":
+		return false
 	}
 	return defaultValue
 }

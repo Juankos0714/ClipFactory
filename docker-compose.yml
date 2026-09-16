@@ -1,6 +1,11 @@
-version: "3.9"
-
 services:
+  # ------------------------------------------------------------------
+  # clipfactory-dev: contenedor de DESARROLLO
+  #
+  # No corre el worker: se queda con 'sleep infinity' para entrar con
+  # 'docker compose exec' a compilar, mirar la DB, etc. El código fuente
+  # se monta por volumen.
+  # ------------------------------------------------------------------
   clipfactory-dev:
     build:
       context: .
@@ -26,7 +31,70 @@ services:
       - CLIPFACTORY_LOG_LEVEL=debug
       # ruta del binario de descarga de clips (instalado en la imagen)
       - CLIPFACTORY_TWITCH_DOWNLOADER_PATH=TwitchDownloaderCLI
-    # mantener el contenedor corriendo para poder ejecutar comandos
     # mantener el contenedor corriendo para poder ejecutar comandos con 'docker compose exec'
     command: ["sleep", "infinity"]
     restart: "no"
+
+  # ------------------------------------------------------------------
+  # clipfactory: el WORKER (el servicio real del pipeline)
+  #
+  # Compila el código montado y corre el binario con exec, así que el
+  # proceso del worker es PID 1 del contenedor: recibe el SIGTERM de
+  # 'docker stop' DIRECTAMENTE (sin intermediarios) y puede apagar
+  # gracefully: aborta HTTP/ffmpeg en vuelo, re-encola los jobs que
+  # estaban ejecutando y cierra la DB limpia (exit code 0).
+  #
+  # stop_grace_period: techo que Docker le da al apagado antes de
+  # SIGKILL. 90s cubre ffmpeg y thumbnails del hardware objetivo; si un
+  # upload de YouTube larga necesita más, el SIGKILL no corrompe nada
+  # (el job queda huérfano y el stale-lock de 30s lo re-encola al
+  # rearrancar). Para dar más margen puntualmente:
+  #   docker stop -t 300 clipfactory
+  #
+  # healthcheck: 'clipfactory status' es una lectura SQLite barata
+  # (GROUP BY counts); NO toca la cola ni compite por locks. Exit 0 =
+  # proceso vivo + DB accesible. start_period largo a propósito: cubre la
+  # compilación del primer arranque (~1min en el i3) sin marcar unhealthy.
+  # ------------------------------------------------------------------
+  clipfactory:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    container_name: clipfactory
+    volumes:
+      - ./app:/opt/clipfactory/app
+      - ./config:/opt/clipfactory/config
+      - ./credentials:/opt/clipfactory/credentials
+      - ./data:/opt/clipfactory/data
+      - ./database:/opt/clipfactory/database
+      - ./logs:/opt/clipfactory/logs
+    environment:
+      - CLIPFACTORY_DATA_DIR=/opt/clipfactory/data
+      - CLIPFACTORY_DB_PATH=/opt/clipfactory/database/clipfactory.db
+      - CLIPFACTORY_LOG_DIR=/opt/clipfactory/logs
+      - CLIPFACTORY_CONFIG_DIR=/opt/clipfactory/config
+      - CLIPFACTORY_CREDENTIALS_DIR=/opt/clipfactory/credentials
+      - CLIPFACTORY_LOG_LEVEL=info
+      - CLIPFACTORY_TWITCH_DOWNLOADER_PATH=TwitchDownloaderCLI
+      # auto-discovery al arrancar (default true); false para solo procesar
+      # la cola existente y encolar pasadas a mano con el CLI 'discovery'
+      # - CLIPFACTORY_DISCOVER_ON_START=false
+    # rebuild + exec: entrypoint explícito en bash -c (la imagen trae
+    # ENTRYPOINT [clipfactory], que si no se comería los args como comando del
+    # CLI). El 'exec' final REEMPLAZA al bash: el binario queda como PID 1 y
+    # recibe el SIGTERM del stop directamente.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        cd /opt/clipfactory/app
+        CGO_ENABLED=0 go build -o /opt/clipfactory/bin/clipfactory ./cmd/clipfactory
+        exec /opt/clipfactory/bin/clipfactory worker
+    stop_grace_period: 90s
+    healthcheck:
+      test: ["CMD", "/opt/clipfactory/bin/clipfactory", "status"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 2m
+    restart: unless-stopped

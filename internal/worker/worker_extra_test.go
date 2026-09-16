@@ -186,7 +186,7 @@ func TestExecuteKnownJobTypeCompletes(t *testing.T) {
 	// 'publish' necesita su cadena completa de fixtures (clip + publication).
 	conn := openTestDB(t)
 	w := newTestWorker(t, conn)
-	w.publisher = &fakePublisher{writeOutput: true}
+	w.publishers = map[string]Publisher{"youtube": &fakePublisher{writeOutput: true}}
 	pubs := setupPublishChains(t, conn, t.TempDir(), 1)
 
 	job := &db.Job{Type: "publish", ReferenceID: pubs[0].ID, ReferenceType: "publications"}
@@ -211,7 +211,7 @@ func TestExecuteKnownJobTypeCompletes(t *testing.T) {
 func TestWorkerProcessesJobsFromInjectedDB(t *testing.T) {
 	conn := openTestDB(t)
 	w := newTestWorker(t, conn)
-	w.publisher = &fakePublisher{writeOutput: true}
+	w.publishers = map[string]Publisher{"youtube": &fakePublisher{writeOutput: true}}
 
 	// 3 cadenas publication completas y sus jobs 'publish' encolados en la DB
 	// compartida: el worker debe procesar los 3 sin configuración extra

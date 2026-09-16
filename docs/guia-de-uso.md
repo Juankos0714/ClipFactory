@@ -45,6 +45,30 @@ datos. Para el **por qué** de cada decisión técnica, ver
 
 ### Paso 1: clonar y levantar el contenedor de desarrollo
 
+El compose define DOS servicios:
+
+- **clipfactory-dev**: el playground de desarrollo (`sleep infinity`); entrás
+  con `docker compose exec` a compilar y mirar la DB.
+- **clipfactory**: el worker REAL, que compila el código montado, corre el
+  binario como PID 1 y se mantiene con `restart: unless-stopped`. Tiene
+  healthcheck (`clipfactory status` cada 30s) y `stop_grace_period: 90s`:
+  `docker stop` le llega directo al worker, que apaga gracefully (jobs en
+  curso re-encolados, DB cerrada limpia, exit 0) — ver §3.
+
+Para trabajar solo con desarrollo:
+
+```powershell
+docker compose up -d clipfactory-dev
+```
+
+Para correr el pipeline (sin credenciales arranca igual, con avisos):
+
+```powershell
+docker compose up -d clipfactory
+docker compose ps             # STATUS debe mostrar "Up ... (healthy)"
+docker compose logs -f clipfactory
+```
+
 ```powershell
 cd clipfactory
 docker compose up -d          # construye la imagen dev la primera vez (unos minutos)
@@ -72,12 +96,16 @@ docker compose exec clipfactory-dev /opt/clipfactory/bin/clipfactory worker
 Debe arrancar con dos avisos esperados:
 
 ```
-aviso: Twitch.ClientID vacío — los jobs 'discovery' y 'download' fallarán hasta configurar credentials/twitch.conf
-aviso: YouTube sin credenciales — los jobs 'publish' fallarán hasta configurar credentials/youtube.conf
+aviso: Twitch.ClientID vacío — los jobs de twitch fallarán hasta configurar credentials/twitch.conf
+aviso: YouTube sin credenciales — los jobs 'publish' de youtube fallarán hasta configurar credentials/youtube.conf
+aviso: Meta sin credenciales — los jobs 'publish' de meta fallarán hasta configurar credentials/meta.conf
 worker corriendo... (presiona Ctrl+C para detener)
 ```
 
-Eso es degradación controlada: el worker corre y la DB se crea con sus 7 tablas.
+(Kick no genera aviso: no requiere credenciales.)
+
+Eso es degradación controlada: el worker corre y la DB se crea con sus 8 tablas
+(7 de negocio + `schema_migrations`, el registro de migraciones).
 Detenelo con Ctrl+C y seguí configurando.
 
 ## 3. Comandos del CLI
@@ -85,14 +113,25 @@ Detenelo con Ctrl+C y seguí configurando.
 ```
 clipfactory [command]
 
-worker       arranca el worker: sondea la cola de jobs cada 5s y los ejecuta
-status       resumen del sistema (MVP: sources configurados y WorkerID)
-discovery    (stub, aún no implementado)
+worker       arranca el worker: sondea la cola de jobs cada 5s, los ejecuta y
+             al arrancar encola discovery para los canales activos
+             (CLIPFACTORY_DISCOVER_ON_START=false para desactivarlo).
+             SIGINT/SIGTERM (Ctrl+C, docker stop) apagan gracefully: se
+             espera a los jobs en curso y se re-encolan para el próximo
+             arranque; una segunda señal fuerza la salida inmediata.
+             En compose, el servicio 'clipfactory' tiene stop_grace_period
+             de 90s (más margen puntual: docker stop -t 300 clipfactory).
+status       resumen del sistema leyendo la DB (jobs, videos, clips,
+             publications por estado, versión de esquema)
+discovery    encola un job de discovery por cada canal activo (idempotente:
+             no duplica si ya hay uno en vuelo). Útil para re-disparar una
+             pasada sin reiniciar el worker.
 help         ayuda
 ```
 
-El comando que importa es **worker**: hace todo el pipeline. Los otros dos son
-auxiliares/informativos.
+El comando que importa es **worker**: hace todo el pipeline, incluida la
+primera pasada de discovery (auto-discovery al arrancar). Los otros dos son
+auxiliares: discovery re-dispara pasadas a mano y status muestra el estado.
 
 ## 4. Configurar credenciales
 
@@ -125,6 +164,23 @@ CATEGORY_ID = 20            # 20 = Gaming
 
 Cómo generar el REFRESH_TOKEN (una sola vez): **[Guía de YouTube](guia-youtube.md)**.
 
+### Meta / Facebook (obligatorio solo para publish en Facebook)
+
+Creá `credentials/meta.conf` para publicar los clips como **Reels de una página**:
+
+```
+PAGE_ID = 123456789012345          # ID de tu página de Facebook
+ACCESS_TOKEN = EAAG...             # Page Access Token (no el token de usuario)
+GRAPH_API_VERSION = v21.0          # opcional (default v21.0)
+```
+
+El Page Access Token se genera en developers.facebook.com (app → Messenger/
+Graph API Explorer → extender permisos `pages_manage_posts` +
+`pages_read_engagement` → canjear por token de página). El upload usa la Graph
+API (`POST /{page-id}/videos` con `upload_type=reel`): sube el archivo directo
+(multipart) o, si configurás una base pública de archivos en el adaptador, por
+`file_url`.
+
 ### Verificar que los lee
 
 ```powershell
@@ -144,6 +200,37 @@ docker compose exec clipfactory-dev sqlite3 /opt/clipfactory/database/clipfactor
 ```
 
 ### 5.2 Encolar la primera pasada de discovery
+
+**Normalmente no hace falta hacer nada**: al arrancar, el worker encola solo un
+job de discovery por cada canal activo (auto-discovery, una vez por proceso).
+Con el canal dado de alta en sources.yaml (o en la tabla sources),
+
+```powershell
+docker compose up -d
+docker compose logs -f clipfactory
+```
+
+muestra en el log `[worker] auto-discovery: 1 encolados, 0 ya en vuelo` y la
+cadena del pipeline arranca sola.
+
+Si querés disparar una pasada SIN reiniciar el worker (o con el auto-discovery
+desactivado), usá el comando `discovery`, que encola una pasada por cada canal
+activo (aplicando antes el sources.yaml):
+
+```powershell
+docker compose run --rm clipfactory-dev /opt/clipfactory/bin/clipfactory discovery
+```
+
+Salida esperada:
+
+```
+discovery encolado: twitch/1337 (source 1) → job 1
+
+listo: 1 discovery encolados, 0 ya en vuelo. Arrancá el worker para procesarlos.
+```
+
+Si preferís hacerlo a mano (o querés re-descubrir UN canal puntual), el método
+directo sigue siendo insertar el job por sqlite3:
 
 ```powershell
 # averiguá el id de tu source (será 1 si es el primero):
@@ -173,23 +260,27 @@ En el log verás la cadena completa ejecutarse sola:
 Resultado: un clip vertical 1080x1920 en `data/completed/` y su JPEG en
 `data/thumbnails/`.
 
-### 5.4 Publicar en YouTube
+### 5.4 Publicar en YouTube o Facebook
 
-Hoy (MVP) el job `publish` no se encola automáticamente. Para publicar un clip
-procesado, insertá la publication y su job:
+Creá la fila de `publications` para el clip; el **re-encolado automático** hace
+el resto: cada 5 minutos (`CLIPFACTORY_POLL_PUBLICATIONS_INTERVAL`) el job
+`poll_publications` encola un `publish` por cada publication pendiente, y si un
+upload falla o se queda sin cuota, el propio worker programa el reintento solo
+(backoff exponencial con cap 24h; cuota de YouTube → ~24h).
 
 ```bash
-# 1) crear la fila de publication para el clip (platform='youtube'):
+# publication para YouTube (platform='youtube'):
 sqlite3 database/clipfactory.db "INSERT INTO publications (clip_id, platform, status) VALUES (1, 'youtube', 'pending');"
-# 2) encolar el job apuntando a esa fila:
+# publication para Facebook Reels (platform='meta'):
+sqlite3 database/clipfactory.db "INSERT INTO publications (clip_id, platform, status) VALUES (1, 'meta', 'pending');"
+# dentro de ≤5 min el worker lo toma solo. Para publicar YA, encolá el job a mano:
 sqlite3 database/clipfactory.db "INSERT INTO jobs (type, reference_id, reference_type, status) VALUES ('publish', 1, 'publications', 'queued');"
 #  (reference_id = publications.id, será 1 si es la primera)
-# 3) el worker en ejecución lo toma en el próximo poll (≤5s) y sube el video.
 ```
 
 Si la cuota diaria de YouTube se agota (≈6 uploads/día con el default), la
-publicación entra en `waiting_rate_limit` y se reintenta sola al día siguiente
-(`GetPendingPublications`). Ver §8 para verificar.
+publicación entra en `waiting_rate_limit` y se re-encola sola al día siguiente.
+Ver §8 para verificar.
 
 ## 6. Operación diaria
 
@@ -210,20 +301,36 @@ nuevos de un canal caben holgado en una página de 100).
 
 ## 7. Dar de alta canales a monitorear
 
-```bash
-# alta
-sqlite3 database/clipfactory.db "INSERT INTO sources (platform, channel_id, channel_name, active) VALUES ('twitch', '4919', 'illojuan', 1);"
+**Forma recomendada: `config/sources.yaml`** (copiá `sources.yaml.example`).
+Se aplica a la tabla `sources` en cada arranque del worker (upsert idempotente):
 
-# pausar un canal sin borrarlo (el discovery lo salta)
-sqlite3 database/clipfactory.db "UPDATE sources SET active = 0 WHERE id = 2;"
-
-# reactivar
-sqlite3 database/clipfactory.db "UPDATE sources SET active = 1 WHERE id = 2;"
+```yaml
+sources:
+  - platform: twitch
+    channel_id: "4919"          # broadcaster ID numérico (Guía de Twitch §6)
+    channel_name: illojuan
+    active: true
+  - platform: kick              # Kick como ORIGEN de clips (igual que Twitch)
+    channel_id: xokas           # slug del canal en kick.com
+    channel_name: xokas (kick)
 ```
 
-El `channel_id` es el broadcaster ID numérico de Twitch (cómo conseguirlo:
-[Guía de Twitch §6](guia-twitch.md#6-encontrar-el-channel-id-de-un-canal)).
-Un `sources.yaml` para evitar tocar la DB está en el roadmap.
+Para pausar un canal: `active: false` en el yaml (o `UPDATE sources SET active = 0
+WHERE id = 2;` en la DB). Los canales que están en la DB pero no en el yaml no
+se tocan: el archivo da de alta, no excluye.
+
+**Alternativa: SQL directo** (sigue funcionando):
+
+```bash
+sqlite3 database/clipfactory.db "INSERT INTO sources (platform, channel_id, channel_name, active) VALUES ('twitch', '4919', 'illojuan', 1);"
+```
+
+Para forzar el re-encolado de discovery de un canal (por ejemplo tras darlo de
+alta con el worker ya corriendo), encolá un job:
+
+```bash
+sqlite3 database/clipfactory.db "INSERT INTO jobs (type, reference_id, reference_type, status) VALUES ('discovery', 1, 'sources', 'queued');"
+```
 
 ## 8. Consultas útiles de la DB
 
@@ -292,6 +399,9 @@ VALUES ('publish', <publication_id>, 'publications', 'queued');
 
 Notas:
 
+- Las publications NO necesitan re-encolado manual: el worker solo reintenta
+  (job futuro tras error/cuota + `poll_publications` cada 5m). El INSERT de
+  publish de arriba es solo para adelantar el reintento.
 - Un video en `processing` (worker muerto a mitad de ffmpeg): el próximo run
   retoma el trabajo solo (lock obsoleto tras 30s) o re-encolá `process`.
 - Un `source_clip` en `error` re-encola download normalmente: el handler
@@ -305,7 +415,7 @@ Notas:
 | Síntoma | Causa probable | Solución |
 |---|---|---|
 | `no discoverer configurado` | `twitch.conf` falta o vacío | Completar `credentials/twitch.conf` (§4) y reiniciar el worker |
-| `no publisher configurado` | `youtube.conf` falta o incompleto | Completar CLIENT_ID/SECRET/REFRESH_TOKEN (§4) |
+| `no publisher configurado para la plataforma "youtube"` | `youtube.conf` falta o incompleto | Completar CLIENT_ID/SECRET/REFRESH_TOKEN (§4) |
 | `api returned status 401` (Twitch) | Token vencido (~60 días) | Regenerar App Access Token (Guía de Twitch §4) |
 | `api returned status 429` (Twitch) | Rate limit | Mandar `AUTH_TOKEN` (800 vs 30 pts/min) o bajar frecuencia de discovery |
 | discovery no encuentra clips | `broadcaster_id` mal (usaste el nombre) | Usar el ID numérico (Guía de Twitch §6) |

@@ -1,0 +1,26 @@
+# Canales a monitorear por ClipFactory.
+#
+# Este archivo se aplica a la tabla `sources` de la DB en CADA arranque del
+# worker (upsert idempotente): canales nuevos se dan de alta, existentes
+# actualizan nombre/active. Los canales que están en la DB pero no acá NO se
+# tocan (este archivo da de alta, no excluye).
+#
+# Formato (subconjunto de YAML, sin dependencias externas):
+#   - platform:     "twitch" o "kick" (obligatorio)
+#   - channel_id:   Twitch → broadcaster ID numérico (Guía de Twitch §6)
+#                   Kick   → slug del canal (kick.com/<slug>)
+#   - channel_name: nombre legible (default: el propio channel_id)
+#   - active:       true/false (default true; false = pausado)
+#
+# Copiar a config/sources.yaml (o el directorio de CLIPFACTORY_CONFIG_DIR).
+
+sources:
+  - platform: twitch
+    channel_id: "4919"
+    channel_name: illojuan
+    active: true
+
+  - platform: kick
+    channel_id: xokas
+    channel_name: xokas (kick)
+    # active default: true

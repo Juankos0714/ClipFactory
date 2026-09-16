@@ -8,6 +8,7 @@ package worker
 //   NewWorker(cfg)  → crea el worker (abre la DB o usa una inyectada, útil en tests)
 //   w.Start()       → arranca goroutines: manejo de señales + loop de polling
 //   w.loop()        → cada PollInterval: processJobs() → GetPendingJobs + LockJob
+//                     + una vez: enqueueInitialDiscoveries() (auto-discovery)
 //   w.executeJob()  → despacha por tipo (discovery/download/process/thumbnail/publish)
 //   w.Stop()        → cierra stopCh, espera a las goroutines (shutdown graceful)
 //
@@ -31,6 +32,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -53,13 +55,32 @@ import (
 // (adaptador de Twitch + ffmpeg + YouTube); en tests se usan fakes. Si son
 // nil, los jobs correspondientes fallan con un mensaje claro.
 type WorkerConfig struct {
-	DB                *sql.DB     // nil = el worker abre su propia conexión con InitDB(DBPath)
-	Discoverer        Discoverer  // job 'discovery' (nil = esos jobs fallan con mensaje claro)
-	Downloader        Downloader  // job 'download'  (idem)
-	Processor         Processor   // job 'process'   (idem)
-	Thumbnailer       Thumbnailer // job 'thumbnail' (idem)
-	Publisher         Publisher   // job 'publish'   (idem)
-	DataDir           string      // raíz de archivos (incoming/, completed/, thumbnails/)
+	// DiscoverOnStart activa el AUTO-DISCOVERY: en el primer tick del loop, el
+	// worker encola un job 'discovery' por cada canal ACTIVO de la tabla sources
+	// (idempotente vía EnsureActiveJob: no duplica si ya hay uno en vuelo). Es lo
+	// que hace que "arrancar el worker y ya" sea suficiente: sin esto, la primera
+	// pasada requeriría encolar jobs a mano (CLI 'discovery' o sqlite3). El job
+	// se encola UNA vez por proceso: si el discovery falla, el reintento lo maneja
+	// el operador (CLI discovery) o el próximo arranque del worker. Default: true
+	// (ver DefaultWorkerConfig; CLIPFACTORY_DISCOVER_ON_START=false para desactivar).
+	DiscoverOnStart bool
+
+	// PollPublicationsInterval cada cuánto encolar el job poll_publications, que
+	// re-encola los publishes de publications pendientes (reintento automático
+	// tras error o cuota agotada). 0 = sin auto-poll (los publishes se encolan
+	// a mano o por otro mecanismo). Default: 5m (ver DefaultWorkerConfig).
+	PollPublicationsInterval time.Duration
+
+	DB                *sql.DB               // nil = el worker abre su propia conexión con InitDB(DBPath)
+	Discoverer        Discoverer            // (legacy) hoy Twitch: queda registrado como discoverer "twitch"
+	Discoverers       map[string]Discoverer // por plataforma: "twitch", "kick" (agrega/sobrescribe al legacy)
+	Downloader        Downloader            // (legacy) hoy Twitch: queda registrado como downloader "twitch"
+	Downloaders       map[string]Downloader // por plataforma (agrega/sobrescribe al legacy)
+	Processor         Processor             // job 'process'   (idem)
+	Thumbnailer       Thumbnailer           // job 'thumbnail' (idem)
+	Publisher         Publisher             // (legacy) hoy YouTube: queda registrado como publisher "youtube"
+	Publishers        map[string]Publisher  // por plataforma: "youtube", "meta" (agrega/sobrescribe al legacy)
+	DataDir           string                // raíz de archivos (incoming/, completed/, thumbnails/)
 	DBPath            string
 	WorkerID          string
 	MaxConcurrentJobs int
@@ -69,10 +90,13 @@ type WorkerConfig struct {
 // DefaultWorkerConfig retorna la configuración por defecto para el hardware objetivo (i3-3220, 2 núcleos).
 func DefaultWorkerConfig(dbPath string) WorkerConfig {
 	return WorkerConfig{
-		DBPath:            dbPath,
-		WorkerID:          "worker-main",
-		MaxConcurrentJobs: 2, // 1 ffmpeg + 1 download: adecuado para el i3-3220 (2 núcleos)
-		PollInterval:      5 * time.Second,
+		DBPath:                   dbPath,
+		WorkerID:                 "worker-main",
+		MaxConcurrentJobs:        2, // 1 ffmpeg + 1 download: adecuado para el i3-3220 (2 núcleos)
+		PollInterval:             5 * time.Second,
+		// auto-discovery: la primera pasada no necesita el CLI 'discovery'
+		DiscoverOnStart:          true,
+		PollPublicationsInterval: 5 * time.Minute, // re-encolado automático de publishes
 	}
 }
 
@@ -132,17 +156,21 @@ type Publisher interface {
 // "resuelta" de WorkerConfig (si cfg.Discoverer era nil, discoverer queda nil y el
 // job fallará con mensaje claro).
 type Worker struct {
-	cfg         WorkerConfig
-	db          *sql.DB        // conexión a SQLite (inyectada o propia)
-	discoverer  Discoverer     // nil = jobs 'discovery' fallan con mensaje claro
-	downloader  Downloader     // nil = jobs 'download' fallan con mensaje claro
-	processor   Processor      // nil = jobs 'process' fallan con mensaje claro
-	thumbnailer Thumbnailer    // nil = jobs 'thumbnail' fallan con mensaje claro
-	publisher   Publisher      // nil = jobs 'publish' fallan con mensaje claro
-	ownDB       bool           // true si el worker abrió su propia conexión (y debe cerrarla)
-	stopCh      chan struct{}  // cerrado por Stop(): apaga el loop y las goroutines
-	wg          sync.WaitGroup // espera a loop + jobs en curso al hacer Stop()
-	started     atomic.Bool    // guarda Start/Stop idempotentes y sin carreras
+	cfg              WorkerConfig
+	db               *sql.DB               // conexión a SQLite (inyectada o propia)
+	discoverers      map[string]Discoverer // por plataforma: twitch, kick
+	downloader       Downloader            // (legacy) = downloaders["twitch"] si se configuró
+	downloaders      map[string]Downloader // por plataforma: twitch (TwitchDownloaderCLI), kick (HTTP)
+	processor        Processor             // nil = jobs 'process' fallan con mensaje claro
+	thumbnailer      Thumbnailer           // nil = jobs 'thumbnail' fallan con mensaje claro
+	publishers       map[string]Publisher  // por plataforma: youtube, meta
+	ownDB            bool                  // true si el worker abrió su propia conexión (y debe cerrarla)
+	stopCh           chan struct{}         // cerrado por Stop(): apaga el loop y las goroutines
+	wg               sync.WaitGroup        // espera a loop + jobs en curso al hacer Stop()
+	started          atomic.Bool           // guarda Start/Stop idempotentes y sin carreras
+	pollMu           sync.Mutex            // serializa el poll de publications (EnsureActiveJob es check-then-insert)
+	pollLastEnqueued time.Time             // última vez que se encoló (o intentó) el poll_publications
+	discoveryTried   atomic.Bool           // auto-discovery ya intentado (UNA vez por proceso, no por tick)
 }
 
 // DefaultDataDir es el directorio de datos por defecto (coincide con config.LoadConfig).
@@ -172,13 +200,43 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 	w := &Worker{
 		cfg:         cfg,
 		db:          conn,
-		discoverer:  cfg.Discoverer,
-		downloader:  cfg.Downloader,
 		processor:   cfg.Processor,
 		thumbnailer: cfg.Thumbnailer,
-		publisher:   cfg.Publisher,
 		ownDB:       ownDB,
 		stopCh:      make(chan struct{}),
+	}
+
+	// Discoverers por plataforma: Discoverer (campo clásico, hoy Twitch) queda
+	// registrado como "twitch" para no romper tests existentes; el mapa de
+	// cfg.Discoverers agrega o sobrescribe por plataforma.
+	w.discoverers = make(map[string]Discoverer)
+	if cfg.Discoverer != nil {
+		w.discoverers["twitch"] = cfg.Discoverer
+	}
+	for platform, d := range cfg.Discoverers {
+		w.discoverers[platform] = d
+	}
+
+	// Downloaders por plataforma: misma lógica que los discoverers (el campo
+	// clásico Downloader es Twitch → "twitch"; Kick trae el suyo por cfg).
+	w.downloaders = make(map[string]Downloader)
+	if cfg.Downloader != nil {
+		w.downloaders["twitch"] = cfg.Downloader
+		w.downloader = cfg.Downloader // compat con tests que leen el campo directo
+	}
+	for platform, d := range cfg.Downloaders {
+		w.downloaders[platform] = d
+	}
+
+	// Publishers por plataforma: Publisher (campo clásico, hoy YouTube) queda
+	// como "youtube" para no romper tests existentes; cfg.Publishers agrega o
+	// sobrescribe (así main.go registra meta y futuras plataformas).
+	w.publishers = make(map[string]Publisher)
+	if cfg.Publisher != nil {
+		w.publishers["youtube"] = cfg.Publisher
+	}
+	for platform, p := range cfg.Publishers {
+		w.publishers[platform] = p
 	}
 
 	return w, nil
@@ -243,9 +301,63 @@ func (w *Worker) loop(ctx context.Context) {
 			log.Println("[worker] stop channel closed, stopping loop")
 			return
 		case <-ticker.C:
+			// auto-discovery en el primer tick (UNA vez por proceso): encola
+			// discovery por cada source activo para que el pipeline arranque solo
+			w.maybeDiscoverOnStart(ctx)
 			w.processJobs(ctx)
+			w.maybePollPublications(ctx)
 		}
 	}
+}
+
+// maybeDiscoverOnStart implementa el AUTO-DISCOVERY: en el primer tick del loop
+// encola un job 'discovery' por cada canal ACTIVO (GetSources solo devuelve
+// active=1). UNA sola vez por proceso (discoveryTried): si un discovery falla,
+// el reintento es tarea del operador (CLI discovery) o del próximo arranque —
+// re-encolar automáticamente en cada tick convertiría un fallo persistente
+// (p.ej. canal inexistente) en spam de jobs en error.
+//
+// EnsureActiveJob hace el encolado idempotente: si ya hay un discovery en
+// vuelo (queued/running) para el canal, no duplica (protege también contra
+// varios workers arrancando sobre la misma DB).
+//
+// DiscoverOnStart=false lo desactiva por completo (operador que prefiere
+// disparar las pasadas a mano con el CLI 'discovery').
+func (w *Worker) maybeDiscoverOnStart(ctx context.Context) {
+	if !w.cfg.DiscoverOnStart {
+		return // desactivado por config
+	}
+	if !w.discoveryTried.CompareAndSwap(false, true) {
+		return // ya se intentó en un tick anterior
+	}
+
+	sources, err := db.GetSources(w.db)
+	if err != nil {
+		log.Printf("[worker] auto-discovery: error listando sources: %v", err)
+		return
+	}
+	if len(sources) == 0 {
+		log.Printf("[worker] auto-discovery: sin canales activos en sources")
+		return
+	}
+
+	enqueued := 0
+	skipped := 0
+	for _, src := range sources {
+		job := &db.Job{Type: "discovery", ReferenceID: src.ID, ReferenceType: "sources"}
+		added, err := db.EnsureActiveJob(w.db, job)
+		if err != nil {
+			log.Printf("[worker] auto-discovery: error encolando discovery de %s/%s: %v", src.Platform, src.ChannelID, err)
+			continue
+		}
+		if added {
+			enqueued++
+		} else {
+			skipped++
+		}
+	}
+	log.Printf("[worker] auto-discovery: %d encolados, %d ya en vuelo (%d canales activos)", enqueued, skipped, len(sources))
+	_ = ctx // reservado para cancelación futura
 }
 
 // processJobs toma hasta MaxConcurrentJobs jobs pendientes de la cola y los
@@ -295,6 +407,10 @@ func (w *Worker) processJobs(ctx context.Context) {
 //     fatal para el worker: el pipeline sigue con los demás jobs)
 //   - pánico en el handler → se recupera y marca 'error' (no queda colgado en
 //     'running' hasta el stale-lock de 30s)
+//   - apagado (ctx cancelado mientras el handler corre) → el job se RE-ENCOLA
+//     ('queued', sin error): no fue un fallo del trabajo; el próximo arranque
+//     lo retoma (handlers idempotentes, semántica at-least-once). Ver
+//     requeueInterruptedJob.
 func (w *Worker) executeJob(ctx context.Context, job db.Job) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -318,12 +434,22 @@ func (w *Worker) executeJob(ctx context.Context, job db.Job) (err error) {
 		err = w.executeThumbnail(ctx, job)
 	case "publish":
 		err = w.executePublish(ctx, job)
+	case "poll_publications":
+		err = w.pollPublications(ctx)
 	default:
 		log.Printf("[worker] unknown job type: %s", job.Type)
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}
 
 	if err != nil {
+		// apagado en curso (señal → ctx cancelado): el job NO se marca 'error',
+		// se re-encola para que el próximo arranque lo retome. La comprobación va
+		// ANTES de FailJob: un ctx cancelado puede ser también la CAUSA del error
+		// del handler (descarga/ffmpeg abortados), y eso no es un fallo del clip.
+		if ctx.Err() != nil {
+			w.requeueInterruptedJob(job)
+			return err
+		}
 		if failErr := db.FailJob(w.db, job.ID, err.Error()); failErr != nil {
 			log.Printf("[worker] error marking job %d as failed: %v", job.ID, failErr)
 		}
@@ -334,7 +460,134 @@ func (w *Worker) executeJob(ctx context.Context, job db.Job) (err error) {
 	if err := db.CompleteJob(w.db, job.ID); err != nil {
 		log.Printf("[worker] error completing job %d: %v", job.ID, err)
 	}
+
+	// éxito PERO ctx cancelado justo después del CompleteJob: re-encolar igual.
+	// El handler terminó su trabajo, pero los pasos que él mismo dispara (p.ej.
+	// enqueue del próximo stage) pueden haberse perdido con el ctx cancelado;
+	// los handlers son idempotentes, así que repetir el job es seguro y el
+	// pipeline no queda a medias.
+	if ctx.Err() != nil {
+		w.requeueInterruptedJob(job)
+	}
 	return nil
+}
+
+// requeueInterruptedJob devuelve a la cola un job que estaba EN EJECUCIÓN
+// cuando llegó el apagado (ctx cancelado por SIGINT/SIGTERM).
+//
+// Por qué no 'error': el trabajo no falló, lo interrumpió el shutdown; marcarlo
+// error contaminaría los conteos y dispararía backoffs de publications sin
+// motivo. Por qué no dejarlo 'running': bloquearía hasta el stale-lock de 30s
+// (y en Docker con restart=always el container rearranca antes). RequeueJob lo
+// deja 'queued' al instante y la idempotencia de los handlers (at-least-once)
+// hace seguro repetir el trabajo.
+//
+// Solo actúa si el job sigue 'running' y con NUESTRO lock (RequeueJob verifica
+// locked_by): si mientras tanto otro worker lo retomó (stale lock) o cambió de
+// estado, no se toca.
+func (w *Worker) requeueInterruptedJob(job db.Job) {
+	requeued, err := db.RequeueJob(w.db, job.ID, w.cfg.WorkerID)
+	if err != nil {
+		log.Printf("[worker] job %d: no se pudo re-encolar tras el apagado: %v (el stale-lock de 30s lo recuperará)", job.ID, err)
+		return
+	}
+	if requeued {
+		log.Printf("[worker] job %d re-encolado tras el apagado (se retomará al rearrancar)", job.ID)
+	}
+}
+
+// maybePollPublications encola el job 'poll_publications' cuando el intervalo
+// PollPublicationsInterval venció (0 = desactivado). Es el mecanismo de
+// RE-ENCOLADO AUTOMÁTICO de publications: el job, al ejecutarse, encola un
+// 'publish' por cada publication pendiente (tras error o cuota agotada).
+//
+// Es best-effort y a prueba de workers duplicados: EnsureActiveJob no encola
+// si ya hay un poll en vuelo (queued/running), y el mutex serializa los ticks
+// concurrentes de este mismo worker.
+func (w *Worker) maybePollPublications(ctx context.Context) {
+	interval := w.cfg.PollPublicationsInterval
+	if interval <= 0 {
+		return // desactivado (config explícita del operador)
+	}
+
+	w.pollMu.Lock()
+	defer w.pollMu.Unlock()
+
+	if !w.pollLastEnqueued.IsZero() && time.Since(w.pollLastEnqueued) < interval {
+		return // aún no vence el intervalo
+	}
+
+	job := &db.Job{Type: "poll_publications", ReferenceID: 0, ReferenceType: "system"}
+	enqueued, err := db.EnsureActiveJob(w.db, job)
+	if err != nil {
+		log.Printf("[worker] error encolando poll_publications: %v", err)
+		return
+	}
+	w.pollLastEnqueued = time.Now() // con o sin encolado: no insistir hasta el próximo intervalo
+	if enqueued {
+		log.Printf("[worker] poll_publications encolado (job %d)", job.ID)
+	}
+	_ = ctx // reservado para cancelación futura
+}
+
+// pollPublications es el corazón del re-encolado automático de publications.
+//
+// Recorre las publications reintentables de TODAS las plataformas conocidas
+// (status 'pending' | 'error' | 'waiting_rate_limit' con next_retry_at vencido,
+// ver GetPendingPublications) y encola un job 'publish' por cada una que NO
+// tenga ya un publish en vuelo (HasActivePublishJob).
+//
+// Contrato con executePublish: las publicaciones con error/cuota quedan con
+// status 'error'/'waiting_rate_limit' + next_retry_at; este job las re-encola
+// cuando vence. Si una publication ya no es reintenteable (published, o el clip
+// desapareció), el publish correspondiente la resuelve (no-op o error de job).
+//
+// El job apunta a reference_type='system', reference_id=0: es un job global.
+func (w *Worker) pollPublications(ctx context.Context) error {
+	platforms := w.publishPlatforms()
+	if len(platforms) == 0 {
+		log.Printf("[worker] poll_publications: sin publishers configurados, no hay nada que re-encolar")
+		return nil
+	}
+
+	totalEnqueued := 0
+	for _, platform := range platforms {
+		pubs, err := db.GetPendingPublications(w.db, platform, 100)
+		if err != nil {
+			return fmt.Errorf("get pending publications de %s: %w", platform, err)
+		}
+		for i := range pubs {
+			if pubs[i].Status == "published" {
+				continue // éxito: nada que hacer
+			}
+			active, err := db.HasActivePublishJob(w.db, pubs[i].ID, 0)
+			if err != nil {
+				return fmt.Errorf("check active publish de publication %d: %w", pubs[i].ID, err)
+			}
+			if active {
+				continue // ya hay un publish en vuelo para esta publication
+			}
+			job := &db.Job{Type: "publish", ReferenceID: pubs[i].ID, ReferenceType: "publications"}
+			if err := db.EnqueueJob(w.db, job); err != nil {
+				return fmt.Errorf("enqueue publish de publication %d: %w", pubs[i].ID, err)
+			}
+			totalEnqueued++
+		}
+	}
+
+	log.Printf("[worker] poll_publications completo: %d publishes re-encolados", totalEnqueued)
+	return nil
+}
+
+// publishPlatforms devuelve las plataformas con publisher configurado, orden
+// determinístico (los mapas no garantizan orden y el poll debe ser estable).
+func (w *Worker) publishPlatforms() []string {
+	platforms := make([]string, 0, len(w.publishers))
+	for p := range w.publishers {
+		platforms = append(platforms, p)
+	}
+	sort.Strings(platforms)
+	return platforms
 }
 
 // executeDiscovery ejecuta el job de discovery de clips nuevos de un canal.
@@ -357,9 +610,6 @@ func (w *Worker) executeJob(ctx context.Context, job db.Job) (err error) {
 // (no de los clips): entre esa marca y la próxima pasada puede haber clips nuevos
 // que caerán en la ventana siguiente.
 func (w *Worker) executeDiscovery(ctx context.Context, job db.Job) error {
-	if w.discoverer == nil {
-		return fmt.Errorf("no discoverer configurado (falta Discoverer en WorkerConfig)")
-	}
 	if job.ReferenceType != "sources" {
 		return fmt.Errorf("job discovery con reference_type inesperado: %s", job.ReferenceType)
 	}
@@ -376,6 +626,14 @@ func (w *Worker) executeDiscovery(ctx context.Context, job db.Job) error {
 		return nil
 	}
 
+	// resolver el Discoverer por la plataforma del source (twitch, kick, ...)
+	// Un Discoverer clásico (cfg.Discoverer) queda registrado como "twitch" en
+	// NewWorker para compatibilidad con configs y tests anteriores.
+	discoverer, ok := w.discoverers[source.Platform]
+	if !ok || discoverer == nil {
+		return fmt.Errorf("no discoverer configurado para la plataforma %q", source.Platform)
+	}
+
 	// ventana temporal: clips creados desde la última revisión
 	var after time.Time
 	if source.LastCheckedAt != nil {
@@ -384,7 +642,7 @@ func (w *Worker) executeDiscovery(ctx context.Context, job db.Job) error {
 
 	// consultar la plataforma (1 página = 100 clips alcanza para MVP;
 	// MaxClipsPerDiscovery permite limitar el backlog en canales muy activos)
-	clips, err := w.discoverer.ListClips(ctx, source.ChannelID, after, 1)
+	clips, err := discoverer.ListClips(ctx, source.ChannelID, after, 1)
 	if err != nil {
 		return fmt.Errorf("list clips de %s/%s: %w", source.Platform, source.ChannelID, err)
 	}
@@ -458,9 +716,6 @@ func (w *Worker) executeDiscovery(ctx context.Context, job db.Job) error {
 // 'error' (reintentable manualmente re-encolándolo: al haber fila en videos,
 // el paso 3 se salta).
 func (w *Worker) executeDownload(ctx context.Context, job db.Job) error {
-	if w.downloader == nil {
-		return fmt.Errorf("no downloader configurado (falta Downloader en WorkerConfig)")
-	}
 	if job.ReferenceType != "source_clips" {
 		return fmt.Errorf("job download con reference_type inesperado: %s", job.ReferenceType)
 	}
@@ -471,6 +726,13 @@ func (w *Worker) executeDownload(ctx context.Context, job db.Job) error {
 	}
 	if sc == nil {
 		return fmt.Errorf("source_clip %d no existe", job.ReferenceID)
+	}
+
+	// resolver el Downloader por la plataforma del clip (twitch usa
+	// TwitchDownloaderCLI, kick descarga por HTTP directo del CDN)
+	downloader, ok := w.downloaders[sc.Platform]
+	if !ok || downloader == nil {
+		return fmt.Errorf("no downloader configurado para la plataforma %q", sc.Platform)
 	}
 	if sc.Status == "downloaded" {
 		// ya descargado en un intento anterior (el job se re-encoló tras un crash
@@ -497,7 +759,13 @@ func (w *Worker) executeDownload(ctx context.Context, job db.Job) error {
 		videoID = existing.ID
 		log.Printf("[worker] video %d ya existe para clip %s, saltando descarga", videoID, sc.PlatformClipID)
 	} else {
-		if err := w.downloader.DownloadClip(ctx, sc.PlatformClipID, destPath); err != nil {
+		if err := downloader.DownloadClip(ctx, sc.PlatformClipID, destPath); err != nil {
+			// apagado en curso: NO marcar el source_clip como error (la descarga
+			// no falló, la interrumpió el shutdown). executeJob re-encolará el job;
+			// al rearrancar, el clip sigue 'detected' y la descarga se reintenta.
+			if ctx.Err() != nil {
+				return fmt.Errorf("download clip %s: %w", sc.PlatformClipID, err)
+			}
 			if updErr := db.UpdateSourceClipStatus(w.db, sc.ID, "error", err.Error()); updErr != nil {
 				log.Printf("[worker] error marcando source_clip %d como error: %v", sc.ID, updErr)
 			}
@@ -608,6 +876,13 @@ func (w *Worker) executeProcess(ctx context.Context, job db.Job) error {
 		}
 
 		if err := w.processor.ProcessVideo(ctx, video.Filepath, destPath); err != nil {
+			// apagado en curso: NO marcar el video como failed (el procesamiento
+			// no falló, lo interrumpió el shutdown). El video queda 'processing' y
+			// el job re-encolado lo retoma: ProcessVideo es idempotente y el .part
+			// huérfano se sobreescribe.
+			if ctx.Err() != nil {
+				return fmt.Errorf("process video %d: %w", video.ID, err)
+			}
 			if updErr := db.UpdateVideoStatus(w.db, video.ID, "failed", err.Error()); updErr != nil {
 				log.Printf("[worker] error marcando video %d como failed: %v", video.ID, updErr)
 			}
@@ -728,15 +1003,12 @@ func (w *Worker) executeThumbnail(ctx context.Context, job db.Job) error {
 //     fallido: no se incrementa el backoff de errores.
 //  6. Otro error: status='error' con backoff exponencial
 //     next_retry_at = now * 2^attempts (cap 24h), attempts+1.
-//
-// Los reintentos NATURALES los hace GetPendingPublications (status error/
-// waiting_rate_limit con next_retry_at vencido): este job es el que encola la
-// PRIMERA publicación por plataforma; quién lo re-encola tras un error es el
-// calling code (en el MVP, el operador o un futuro job 'poll' diario).
+//  7. En los casos 5 y 6 se RE-ENCOLA automáticamente el siguiente intento:
+//     un job 'publish' con created_at = next_retry_at. El scheduler solo ofrece
+//     jobs con created_at <= now, así que el job "duerme" hasta que vence el
+//     backoff/cuota. Complementa al job poll_publications (que re-encola
+//     publications sin job futuro, p.ej. tras un crash del worker).
 func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
-	if w.publisher == nil {
-		return fmt.Errorf("no publisher configurado (falta Publisher en WorkerConfig)")
-	}
 	if job.ReferenceType != "publications" {
 		return fmt.Errorf("job publish con reference_type inesperado: %s", job.ReferenceType)
 	}
@@ -747,6 +1019,14 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 	}
 	if pub == nil {
 		return fmt.Errorf("publication %d no existe", job.ReferenceID)
+	}
+
+	// resolver el Publisher por la plataforma de la publication (youtube, meta).
+	// Un Publisher clásico (cfg.Publisher) queda registrado como "youtube" en
+	// NewWorker para compatibilidad con configs y tests anteriores.
+	publisher, ok := w.publishers[pub.Platform]
+	if !ok || publisher == nil {
+		return fmt.Errorf("no publisher configurado para la plataforma %q", pub.Platform)
 	}
 
 	// idempotencia: ya publicada (crash entre upload y update de DB) → reconciliar
@@ -771,9 +1051,9 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 	description := "Clip generado con ClipFactory"
 	tags := []string{"shorts", "clips"}
 
-	externalID, externalURL, err := w.publisher.UploadVideo(ctx, clip.Filepath, title, description, tags)
+	externalID, externalURL, upErr := publisher.UploadVideo(ctx, clip.Filepath, title, description, tags)
 	switch {
-	case err == nil:
+	case upErr == nil:
 		// éxito: registrar la publicación externa
 		now := time.Now().UTC()
 		if updErr := db.UpdatePublicationStatus(w.db, pub.ID, "published", externalID, externalURL, "", &now, nil, false); updErr != nil {
@@ -786,7 +1066,7 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 
 	default:
 		var rle *youtube.RateLimitError
-		if errors.As(err, &rle) {
+		if errors.As(upErr, &rle) {
 			// cuota agotada: esperar al reset diario (medianoche PT ≈ 08:00 UTC).
 			// NO incrementa attempts (no fue un fallo del clip ni del pipeline)
 			nextRetry := time.Now().UTC().Add(24 * time.Hour)
@@ -794,7 +1074,9 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 				return fmt.Errorf("update publication (rate limit): %w", updErr)
 			}
 			log.Printf("[worker] publication %d espera reset de cuota hasta %v", pub.ID, nextRetry)
-			// el job queda 'done': la publicación se reintentará por GetPendingPublications
+			// el job queda 'done': el reintento queda programado acá y, como
+			// red de seguridad, poll_publications lo re-encola si faltara
+			w.requeuePublish(job, pub.ID, nextRetry)
 			return nil
 		}
 
@@ -804,11 +1086,39 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 			delay = 24 * time.Hour
 		}
 		nextRetry := time.Now().UTC().Add(delay)
-		if updErr := db.UpdatePublicationStatus(w.db, pub.ID, "error", "", "", err.Error(), nil, &nextRetry, true); updErr != nil {
+		if updErr := db.UpdatePublicationStatus(w.db, pub.ID, "error", "", "", upErr.Error(), nil, &nextRetry, true); updErr != nil {
 			return fmt.Errorf("update publication (error): %w", updErr)
 		}
 		log.Printf("[worker] publication %d falló, reintento en %v", pub.ID, delay)
-		return fmt.Errorf("publish clip %d: %w", clip.ID, err)
+		w.requeuePublish(job, pub.ID, nextRetry) // reintento automático cuando venza el backoff
+		return fmt.Errorf("publish clip %d: %w", clip.ID, upErr)
+	}
+}
+
+// requeuePublish programa el SIGUIENTE intento de una publication encolando un
+// job 'publish' con created_at = when (los jobs solo se ofrecen cuando
+// created_at <= now, así que el job "duerme" hasta que vence el backoff/cuota).
+//
+// No toca la fila publications: el estado y next_retry_at ya los escribió el
+// caller. Se excluye de la verificación el PROPIO job en ejecución (running):
+// sin esa exclusión, HasActivePublishJob lo vería como "ya hay uno activo" y
+// nunca re-encolaría. El chequeo evita duplicados frente a poll_publications;
+// si aun así se duplicara, executePublish es idempotente (no-op sobre
+// publications ya published) y el daño es nulo.
+func (w *Worker) requeuePublish(job db.Job, publicationID int64, when time.Time) {
+	w.pollMu.Lock()
+	defer w.pollMu.Unlock()
+
+	if active, err := db.HasActivePublishJob(w.db, publicationID, job.ID); err == nil && active {
+		return // ya hay OTRO publish en vuelo o programado
+	}
+	now := db.NowUTC()
+	if _, err := w.db.Exec(
+		`INSERT INTO jobs (type, reference_id, reference_type, status, created_at, updated_at)
+		 VALUES ('publish', ?, 'publications', 'queued', ?, ?)`,
+		publicationID, when.UTC().Format(time.RFC3339), now,
+	); err != nil {
+		log.Printf("[worker] error re-encolando publish de publication %d: %v (poll_publications lo cubrirá)", publicationID, err)
 	}
 }
 
@@ -824,6 +1134,22 @@ func (w *Worker) Stop() {
 	close(w.stopCh)
 	w.wg.Wait()
 	log.Println("[worker] worker stopped")
+}
+
+// Close libera los recursos del worker: la conexión SQLite SI el worker la abrió
+// él mismo (ownDB). Con DB inyectada (tests, main.go que comparte la conexión)
+// es responsabilidad del dueño cerrarla.
+//
+// Llamar SIEMPRE después de Stop(): cerrar la DB con jobs en vuelo provocaría
+// "database is closed" en los handlers. Es idempotente y seguro sobre nil.
+func (w *Worker) Close() error {
+	if w.ownDB && w.db != nil {
+		if err := w.db.Close(); err != nil {
+			return fmt.Errorf("close db: %w", err)
+		}
+		w.ownDB = false
+	}
+	return nil
 }
 
 // Status devuelve el estado actual del worker.

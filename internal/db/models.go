@@ -220,6 +220,82 @@ func parseTime(s sql.NullString) time.Time {
 	return time.Time{}
 }
 
+// UpsertSource inserta o actualiza un canal de origen, idempotente por
+// (platform, channel_id) — es la versión DB del sources.yaml: al aplicar el
+// archivo en cada arranque, un canal existente actualiza nombre/active sin
+// duplicarse y devuelve en s.ID el ID de la fila (nueva o existente).
+func UpsertSource(db *sql.DB, s *Source) error {
+	var existingID int64
+	err := db.QueryRow(
+		`SELECT id FROM sources WHERE platform = ? AND channel_id = ?`,
+		s.Platform, s.ChannelID,
+	).Scan(&existingID)
+	if err == sql.ErrNoRows {
+		return InsertSource(db, s)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(
+		`UPDATE sources SET channel_name = ?, active = ?, updated_at = ? WHERE id = ?`,
+		s.ChannelName, boolToInt(s.Active), NowUTC(), existingID,
+	); err != nil {
+		return err
+	}
+	s.ID = existingID
+	return nil
+}
+
+// EnsureActiveJob encola un job del tipo dado apuntando a reference (type,
+// reference_id, reference_type) SOLO si no existe otro en 'queued' o 'running'
+// para la misma combinación. Devuelve (true, nil) si encoló uno nuevo;
+// (false, nil) si ya había uno pendiente (no duplica).
+//
+// Lo usa el job poll_publications para re-encolar publishes y re-disparar
+// discovery periódicamente: la cola queda limpia, sin jobs repetidos.
+func EnsureActiveJob(db *sql.DB, j *Job) (bool, error) {
+	var one int
+	err := db.QueryRow(
+		`SELECT 1 FROM jobs WHERE type = ? AND reference_id = ? AND reference_type = ? AND status IN ('queued', 'running') LIMIT 1`,
+		j.Type, j.ReferenceID, j.ReferenceType,
+	).Scan(&one)
+	if err == nil {
+		return false, nil
+	}
+	if err != sql.ErrNoRows {
+		return false, err
+	}
+	if err := EnqueueJob(db, j); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// HasActivePublishJob informa si ya existe un job 'publish' en vuelo
+// (queued/running) para una publication, excluyendo excludeJobID (el propio job
+// que pregunta: cuando executePublish re-encola, su job todavía está 'running').
+// Lo usa executePublish para re-encolar el siguiente intento inmediato solo si
+// no hay ya uno pendiente (idempotencia del poll: el job en vuelo, o el poll
+// mismo, retoman la publication).
+func HasActivePublishJob(db *sql.DB, publicationID, excludeJobID int64) (bool, error) {
+	query := `SELECT 1 FROM jobs WHERE type = 'publish' AND reference_id = ? AND reference_type = 'publications' AND status IN ('queued', 'running')`
+	args := []interface{}{publicationID}
+	if excludeJobID > 0 {
+		query += ` AND id != ?`
+		args = append(args, excludeJobID)
+	}
+	query += ` LIMIT 1`
+	var one int
+	err := db.QueryRow(query, args...).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // GetSources devuelve todos los canales activos (que deben ser monitoreados).
 func GetSources(db *sql.DB) ([]Source, error) {
 	rows, err := db.Query(`SELECT id, platform, channel_id, channel_name, active, last_checked_at, created_at, updated_at FROM sources WHERE active = 1 ORDER BY platform, channel_id`)
@@ -699,20 +775,30 @@ func GetClipByPublication(db *sql.DB, publicationID int64) (*Clip, error) {
 
 // GetPendingJobs devuelve jobs disponibles para procesar, más viejos primero.
 //
-// Dos condiciones para ofrecer un job:
-//  1. status = 'queued' (nadie lo está ejecutando), o
-//  2. locked_at tiene más de 30 segundos: el worker que lo tomó murió y el job
-//     se considera huérfano (stale lock). Con el umbral en RFC3339, la comparación
-//     es lexicográfica y correcta; NO usar datetime(locked_at) porque ese formato
-//     no coincide con el texto que guardamos (ver cabecera de migrations.go).
+// Condiciones para ofrecer un job:
+//  1. status = 'queued' (nadie lo está ejecutando) o 'running' HUÉRFANO (ver 3),
+//  2. created_at <= now: los jobs de reintento de publish se ENCOLAN CON
+//     created_at FUTURO (ver requeuePublish) para que "duerman" hasta que venza
+//     el backoff o el reset de cuota; sin este filtro se ejecutarían de inmediato
+//     y el backoff sería un no-op, o
+//  3. locked_at tiene más de 30 segundos: el worker que lo tomó murió (o el
+//     proceso se cerró de golpe) y el job se considera huérfano (stale lock).
+//     Esto incluye a los jobs en 'running' con lock viejo: quedarse mirando
+//     solo los 'queued' los haría irrecuperables. Con el umbral en RFC3339,
+//     la comparación es lexicográfica y correcta; NO usar datetime(locked_at)
+//     porque ese formato no coincide con el texto que guardamos (ver cabecera
+//     de migrations.go). El LockJob de quien lo retome funciona igual sobre un
+//     job 'running' (ver su comentario).
 func GetPendingJobs(db *sql.DB, limit int) ([]Job, error) {
 	rows, err := db.Query(
 		`SELECT id, type, reference_id, reference_type, status, attempts, locked_at, locked_by, error_message, created_at, updated_at
 		 FROM jobs
-		 WHERE status = 'queued' AND (locked_at IS NULL OR locked_at < ?)
+		 WHERE status IN ('queued', 'running') AND created_at <= ?
+		   AND (locked_at IS NULL OR locked_at < ?)
 		 ORDER BY created_at ASC LIMIT ?`,
+		// created_at <= now: los jobs futuros (reintentos programados) duermen hasta su hora
 		// umbral de stale-lock en RFC3339 para comparar lexicográficamente con locked_at
-		time.Now().UTC().Add(-30*time.Second).Format(time.RFC3339), limit,
+		time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Add(-30*time.Second).Format(time.RFC3339), limit,
 	)
 	if err != nil {
 		return nil, err
@@ -743,23 +829,51 @@ func GetPendingJobs(db *sql.DB, limit int) ([]Job, error) {
 
 // LockJob marca un job como running con el worker que lo tomó.
 //
-// Es atómico a nivel SQL: el WHERE status='queued' garantiza que si dos workers
-// intentan tomar el mismo job a la vez, solo uno logra el UPDATE (RowsAffected=1)
-// y el otro recibe error. Esto reemplaza a un mutex: la cola puede escalar a
-// varios procesos sobre la misma DB sin coordinación extra.
+// Es atómico a nivel SQL: el WHERE (status 'queued', o 'running' con lock
+// vencido — job huérfano de un worker muerto) garantiza que si dos workers
+// intentan tomar el mismo job a la vez, solo uno logra el UPDATE
+// (RowsAffected=1) y el otro recibe error. Esto reemplaza a un mutex: la cola
+// puede escalar a varios procesos sobre la misma DB sin coordinación extra.
 func LockJob(db *sql.DB, id int64, workerID string) error {
+	stale := time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339)
 	res, err := db.Exec(
-		`UPDATE jobs SET status = 'running', locked_at = ?, locked_by = ?, updated_at = ? WHERE id = ? AND status = 'queued'`,
-		NowUTC(), workerID, NowUTC(), id,
+		`UPDATE jobs SET status = 'running', locked_at = ?, locked_by = ?, updated_at = ?
+		 WHERE id = ? AND (status = 'queued' OR (status = 'running' AND (locked_at IS NULL OR locked_at < ?)))`,
+		NowUTC(), workerID, NowUTC(), id, stale,
 	)
 	if err != nil {
 		return err
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("job %d not found or not in queued status", id)
+		return fmt.Errorf("job %d not found or not available to lock", id)
 	}
 	return nil
+}
+
+// RequeueJob devuelve a la cola un job EN EJECUCIÓN (status='running', lock
+// limpio) para que otro proceso —o este mismo al rearrancar— lo ejecute de
+// nuevo. Devuelve true si el update aplicó.
+//
+// Es la pieza del shutdown graceful: un job interrumpido por el apagado (ctx
+// cancelado) NO se marca 'error' (no fue un fallo del trabajo) ni queda
+// 'running' esperando el stale-lock de 30s: se re-encola al instante. Los
+// handlers son idempotentes (semántica at-least-once), así que repetir el
+// trabajo es seguro.
+//
+// El guard locked_by evita pisar a otro worker: si mientras tanto un worker
+// distinto retomó el job (stale lock), el update no aplica (false, nil).
+func RequeueJob(db *sql.DB, id int64, lockedBy string) (bool, error) {
+	res, err := db.Exec(
+		`UPDATE jobs SET status = 'queued', locked_at = NULL, locked_by = NULL, updated_at = ?
+		 WHERE id = ? AND status = 'running' AND locked_by = ?`,
+		NowUTC(), id, lockedBy,
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, _ := res.RowsAffected()
+	return rows > 0, nil
 }
 
 // CompleteJob marca un job como done (fin exitoso del handler).

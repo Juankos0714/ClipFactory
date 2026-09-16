@@ -180,7 +180,7 @@ pipeline, cambia a `public`.
 
 Si falta alguna obligatoria (o el archivo no existe), el worker arranca igual
 pero los jobs `publish` fallan con el mensaje claro
-`no publisher configurado (falta Publisher en WorkerConfig)` y el resto del
+`no publisher configurado para la plataforma "youtube"` y el resto del
 pipeline (discovery → download → process → thumbnail) sigue funcionando.
 
 ## 6. Categorías de YouTube
@@ -206,7 +206,7 @@ Lista completa: `https://developers.google.com/youtube/v3/docs/videoCategories/l
 
 El job `publish` apunta a una fila de `publications`
 (`reference_type='publications'`, `reference_id=publications.id`). Hay **una
-fila por (clip, plataforma)**: un fallo con YouTube no bloquea a TikTok/Kick.
+fila por (clip, plataforma)**: un fallo con YouTube no bloquea a Meta.
 
 ### Máquina de estados de `publications`
 
@@ -286,7 +286,7 @@ sqlite3 database/clipfactory.db "
 
 | `error_message` | Causa | Solución |
 |-----------------|-------|----------|
-| `no publisher configurado` | `youtube.conf` falta o tiene claves vacías | Completar paso 5 y reiniciar el worker |
+| `no publisher configurado para la plataforma "youtube"` | `youtube.conf` falta o tiene claves vacías | Completar paso 5 y reiniciar el worker |
 | `youtube: auth: 401` / `invalid_grant` | Refresh token revocado o expirado (app en Testing >7 días) | Regenerar token (paso 4, con `prompt=consent`); o publicar la app en el consent screen |
 | `youtube: auth: 400 invalid_client` | Client ID/Secret incorrectos | Revisar `youtube.conf` contra el console |
 | `youtube: api devolvió 403: quotaExceeded` | Cuota diaria agotada | Esperar reset (medianoche PT) o pedir más cuota (§8) |
