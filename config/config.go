@@ -20,7 +20,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -85,6 +87,18 @@ type Config struct {
 	// MetricsAddr: dirección para exponer métricas Prometheus (ej: ":9090").
 	// Vacío = desactivado (default).
 	MetricsAddr string
+
+	// APIAddr: dirección donde escucha el servidor HTTP aditivo del comando
+	// 'server' (ej: ":8080"). Vacío = el comando server no arranca.
+	APIAddr string
+
+	// APIToken: token de operador para el header Authorization: Bearer <token>.
+	// Vacío = API sin autenticación (default en desarrollo).
+	APIToken string
+
+	// CORSOrigins: orígenes permitidos por CORS (para el frontend en Vercel o
+	// localhost). Coma-separados; "*" permite cualquiera.
+	CORSOrigins []string
 
 	// Platform credentials (cargadas desde archivos en credentials/)
 	Twitch  TwitchConfig
@@ -173,6 +187,11 @@ func LoadConfig() (*Config, error) {
 	// métricas Prometheus
 	cfg.MetricsAddr = getEnv("CLIPFACTORY_METRICS_ADDR", "")
 
+	// API HTTP aditiva (comando 'server')
+	cfg.APIAddr = getEnv("CLIPFACTORY_API_ADDR", "")
+	cfg.APIToken = getEnv("CLIPFACTORY_API_TOKEN", "")
+	cfg.CORSOrigins = getEnvList("CLIPFACTORY_CORS_ORIGINS", []string{"http://localhost:5173"})
+
 	// 2) sources.yaml (canales a monitorear) — opcional, stub hoy
 	sources, err := loadSources(filepath.Join(cfg.ConfigDir, "sources.yaml"))
 	if err != nil && !os.IsNotExist(err) {
@@ -226,9 +245,19 @@ func stripInlineComment(value string) string {
 	return v
 }
 
-// sourcesYAML define la estructura del archivo sources.yaml para yaml.v3
+// sourcesYAML define la estructura del archivo sources.yaml para yaml.v3.
+// Se usan tipos con tags explícitos en vez de SourceConfig directo para que
+// 'channel_id' (snake_case) mapee bien y para distinguir 'active' ausente
+// (default true) de 'active: false' (por eso *bool).
 type sourcesYAML struct {
-	Sources []SourceConfig `yaml:"sources"`
+	Sources []sourceYAML `yaml:"sources"`
+}
+
+type sourceYAML struct {
+	Platform    string `yaml:"platform"`
+	ChannelID   string `yaml:"channel_id"`
+	ChannelName string `yaml:"channel_name"`
+	Active      *bool  `yaml:"active"`
 }
 
 // loadSources lee los canales a monitorear desde config/sources.yaml usando yaml.v3.
@@ -238,16 +267,17 @@ func loadSources(path string) ([]SourceConfig, error) {
 		return nil, err
 	}
 
+	// KnownFields(true): una clave desconocida es un typo (p.ej. 'chanel_id'),
+	// mejor fallar que arrancar sin ese canal. La lista vacía sí es válida: los
+	// canales también se administran por DB (ver SourceConfig / syncSources).
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec.KnownFields(true)
 	var sy sourcesYAML
-	if err := yaml.Unmarshal(data, &sy); err != nil {
+	if err := dec.Decode(&sy); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%s: error parseando YAML: %w", path, err)
 	}
 
-	if len(sy.Sources) == 0 {
-		return nil, fmt.Errorf("%s: la lista 'sources' está vacía", path)
-	}
-
-	// validación por ítem: lo mínimo para que el discovery funcione
+	sources := make([]SourceConfig, 0, len(sy.Sources))
 	for i, s := range sy.Sources {
 		if s.Platform == "" || s.ChannelID == "" {
 			return nil, fmt.Errorf("%s: sources[%d] necesita 'platform' y 'channel_id'", path, i)
@@ -258,12 +288,22 @@ func loadSources(path string) ([]SourceConfig, error) {
 		default:
 			return nil, fmt.Errorf("%s: sources[%d] plataforma desconocida %q (soportadas: twitch, kick)", path, i, s.Platform)
 		}
-		if s.ChannelName == "" {
-			sy.Sources[i].ChannelName = s.ChannelID // nombre legible por defecto
+		name := s.ChannelName
+		if name == "" {
+			name = s.ChannelID // nombre legible por defecto
 		}
-		// active default true ya se maneja en SourceConfig
+		active := true
+		if s.Active != nil {
+			active = *s.Active
+		}
+		sources = append(sources, SourceConfig{
+			Platform:    s.Platform,
+			ChannelID:   s.ChannelID,
+			ChannelName: name,
+			Active:      active,
+		})
 	}
-	return sy.Sources, nil
+	return sources, nil
 }
 
 // loadMetaConfig lee credentials/meta.conf (mismo formato clave=valor que
@@ -421,6 +461,27 @@ func defaultWorkerID() string {
 		return "worker-local"
 	}
 	return h
+}
+
+// getEnvList lee una variable de entorno coma-separada (ej: CORS origins) y
+// devuelve los valores recortados, descartando vacíos. Si la variable no está
+// definida (o queda vacía) devuelve el default.
+func getEnvList(key string, defaultValue []string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return defaultValue
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return defaultValue
+	}
+	return out
 }
 
 // getEnvBool lee una variable de entorno como bool: "true", "1" y "yes" (en

@@ -49,8 +49,8 @@ func TestMigrateDBLegacyAdoption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("expected schema version 1 after adoption, got %d", version)
+	if version != 2 {
+		t.Errorf("expected schema version 2 after adoption, got %d", version)
 	}
 
 	// los datos previos deben seguir intactos (el DDL no se re-ejecutó)
@@ -67,14 +67,14 @@ func TestMigrateDBLegacyAdoption(t *testing.T) {
 		t.Fatalf("second migrate: %v", err)
 	}
 	version, _ = SchemaVersion(conn)
-	if version != 1 {
-		t.Errorf("expected version still 1, got %d", version)
+	if version != 2 {
+		t.Errorf("expected version still 2, got %d", version)
 	}
 }
 
-// TestMigrateDBNewDBRecordsV1: una DB nueva arranca en versión 1 con la
-// migración registrada con su nombre.
-func TestMigrateDBNewDBRecordsV1(t *testing.T) {
+// TestMigrateDBNewDBRecordsCurrent: una DB nueva arranca en la versión actual
+// con todas las migraciones registradas por nombre.
+func TestMigrateDBNewDBRecordsCurrent(t *testing.T) {
 	conn := setupTestDB(t)
 	defer conn.Close()
 
@@ -82,19 +82,22 @@ func TestMigrateDBNewDBRecordsV1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("expected schema version 1, got %d", version)
+	if version != 2 {
+		t.Errorf("expected schema version 2, got %d", version)
 	}
 
 	applied, err := AppliedMigrations(conn)
 	if err != nil {
 		t.Fatalf("applied migrations: %v", err)
 	}
-	if len(applied) != 1 {
-		t.Fatalf("expected 1 applied migration, got %d", len(applied))
+	if len(applied) != 2 {
+		t.Fatalf("expected 2 applied migrations, got %d", len(applied))
 	}
 	if applied[0] != "1 - initial_schema" {
 		t.Errorf("expected '1 - initial_schema', got %q", applied[0])
+	}
+	if applied[1] != "2 - add_check_constraints" {
+		t.Errorf("expected '2 - add_check_constraints', got %q", applied[1])
 	}
 }
 
@@ -143,8 +146,8 @@ func TestMigrateDBFileBasedIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if v1 != 1 {
-		t.Errorf("expected version 1, got %d", v1)
+	if v1 != 2 {
+		t.Errorf("expected version 2, got %d", v1)
 	}
 	if err := conn1.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -311,7 +314,7 @@ func TestInitDBLegacyFile(t *testing.T) {
 		t.Errorf("expected legacy row preserved, got %d rows", count)
 	}
 	version, err := SchemaVersion(conn2)
-	if err != nil || version != 1 {
-		t.Errorf("expected version 1 after adoption, got %d (%v)", version, err)
+	if err != nil || version != 2 {
+		t.Errorf("expected version 2 after adoption, got %d (%v)", version, err)
 	}
 }

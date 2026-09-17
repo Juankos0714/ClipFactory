@@ -42,9 +42,9 @@ type playlistResponse struct {
 type playlistItemsResponse struct {
 	Items []struct {
 		Snippet struct {
-			Title        string `json:"title"`
-			Description  string `json:"description"`
-			ResourceID   struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			ResourceID  struct {
 				VideoID string `json:"videoId"`
 			} `json:"resourceId"`
 		} `json:"snippet"`

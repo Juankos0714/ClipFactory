@@ -303,8 +303,8 @@ func TestUploadMissingFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
-	if !strings.Contains(err.Error(), "leer video") {
-		t.Errorf("expected 'leer video' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "stat video") {
+		t.Errorf("expected 'stat video' in error, got: %v", err)
 	}
 	// no debió llamarse al endpoint de token
 	if fg.tokenCalls != 0 {

@@ -77,10 +77,10 @@ func TestExecuteJobRequeuesOnCancelledContext(t *testing.T) {
 		_ = w.executeJob(ctx, *job)
 	}()
 
-	<-dl.started        // el handler está en vuelo
-	cancel()            // simular la señal → Stop() → ctx cancelado
-	close(dl.release)   // soltar el handler
-	<-done              // esperar a que executeJob retorne
+	<-dl.started      // el handler está en vuelo
+	cancel()          // simular la señal → Stop() → ctx cancelado
+	close(dl.release) // soltar el handler
+	<-done            // esperar a que executeJob retorne
 
 	// el job debe estar 'queued' (re-encolado), NO 'error'
 	var status, errMsg sql.NullString

@@ -1,10 +1,12 @@
 // Command clipfactory es el punto de entrada (CLI) de ClipFactory.
 //
-// Es un binario con 4 comandos:
+// Es un binario con 5 comandos:
 //
 //	clipfactory worker     → arranca el worker: sondea la cola, ejecuta los jobs
 //	                          y encola discovery de los canales activos al arrancar.
 //	                          Sale limpio (code 0) con SIGINT/SIGTERM.
+//	clipfactory server     → arranca la API REST aditiva (internal/api) sobre la
+//	                          misma SQLite; no ejecuta jobs, los encola.
 //	clipfactory status     → muestra un resumen del estado del sistema
 //	clipfactory discovery  → encola discovery para los canales activos
 //	clipfactory help       → ayuda
@@ -25,17 +27,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"runtime"
 	"slices"
 	"strings"
 	"syscall"
-	"unsafe"
 
 	"github.com/juankos0714/clipfactory/config"
 	"github.com/juankos0714/clipfactory/internal/adapter/ffmpeg"
@@ -43,6 +44,7 @@ import (
 	"github.com/juankos0714/clipfactory/internal/adapter/meta"
 	"github.com/juankos0714/clipfactory/internal/adapter/twitch"
 	"github.com/juankos0714/clipfactory/internal/adapter/youtube"
+	"github.com/juankos0714/clipfactory/internal/api"
 	"github.com/juankos0714/clipfactory/internal/db"
 	"github.com/juankos0714/clipfactory/internal/worker"
 )
@@ -56,6 +58,8 @@ Uso:
 
 Comandos:
   worker       Ejecuta el worker de la cola de jobs
+  server       Arranca la API REST aditiva (requiere CLIPFACTORY_API_ADDR, ej. :8080;
+               auth opcional con CLIPFACTORY_API_TOKEN)
   status       Muestra el estado del sistema
   discovery    encola un job de discovery por cada canal activo (el worker
                los procesa: busca clips nuevos y encola sus descargas)
@@ -92,6 +96,8 @@ func main() {
 	switch command {
 	case "worker":
 		runWorker()
+	case "server":
+		runServer()
 	case "status":
 		runStatus()
 	case "discovery":
@@ -296,6 +302,50 @@ func runWorker() {
 		os.Exit(1)
 	}
 	fmt.Println("[main] apagado completo")
+}
+
+// runServer ejecuta el comando 'server': la API REST aditiva (paquete
+// internal/api) sobre la MISMA SQLite que usa el worker.
+//
+// El server NO ejecuta jobs: expone lecturas de la DB y encola (EnsureActiveJob /
+// EnqueueJob) para que el worker los procese. Puede correr en otro contenedor /
+// proceso que el worker sin conflicto (SQLite WAL permite lecturas concurrentes).
+//
+// Requiere CLIPFACTORY_API_ADDR (ej. ":8080"); con el valor vacío informa y sale
+// (el comando server no arranca sin dirección, ver config.go). La autenticación
+// es opcional: si CLIPFACTORY_API_TOKEN está definido, toda la API exige
+// Authorization: Bearer <token> (salvo /api/health).
+func runServer() {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error cargando config: %v\n", err)
+		os.Exit(1)
+	}
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "config invalida: %v\n", err)
+		os.Exit(1)
+	}
+	if cfg.APIAddr == "" {
+		fmt.Println("CLIPFACTORY_API_ADDR vacío: el comando 'server' no arranca. Configurala, ej. CLIPFACTORY_API_ADDR=:8080")
+		os.Exit(0)
+	}
+
+	conn, err := db.InitDB(cfg.DBPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error abriendo DB %s: %v\n", cfg.DBPath, err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	apiServer := api.NewServer(cfg, conn)
+	if err := apiServer.Run(ctx, cfg.APIAddr); err != nil {
+		fmt.Fprintf(os.Stderr, "error en server: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("[main] server apagado")
 }
 
 // syncSources aplica config/sources.yaml a la tabla sources de la DB.
@@ -640,37 +690,6 @@ func runDoctor() {
 		fmt.Println("❌ Hay problemas que deben corregirse antes de arrancar el worker")
 		os.Exit(1)
 	}
-}
-
-// freeDiskSpace retorna el espacio libre en bytes (duplicado de worker para doctor).
-func freeDiskSpace(path string) (int64, error) {
-	var free int64
-	if runtime.GOOS == "windows" {
-		kernel32 := syscall.NewLazyDLL("kernel32.dll")
-		getDiskFreeSpaceEx := kernel32.NewProc("GetDiskFreeSpaceExW")
-		pathPtr, err := syscall.UTF16PtrFromString(path)
-		if err != nil {
-			return 0, err
-		}
-		var freeBytesAvailable, totalNumberOfBytes, totalNumberOfFreeBytes int64
-		r1, _, err := getDiskFreeSpaceEx.Call(
-			uintptr(unsafe.Pointer(pathPtr)),
-			uintptr(unsafe.Pointer(&freeBytesAvailable)),
-			uintptr(unsafe.Pointer(&totalNumberOfBytes)),
-			uintptr(unsafe.Pointer(&totalNumberOfFreeBytes)),
-		)
-		if r1 == 0 {
-			return 0, fmt.Errorf("GetDiskFreeSpaceEx failed: %v", err)
-		}
-		free = freeBytesAvailable
-	} else {
-		var stat syscall.Statfs_t
-		if err := syscall.Statfs(path, &stat); err != nil {
-			return 0, err
-		}
-		free = int64(stat.Bavail) * int64(stat.Bsize)
-	}
-	return free, nil
 }
 
 // humanizeBytes formatea bytes en formato legible.

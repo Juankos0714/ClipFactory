@@ -26,7 +26,6 @@
 package meta
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -183,8 +182,7 @@ func (p *Publisher) uploadMultipart(ctx context.Context, endpoint, videoPath, de
 	}
 	defer file.Close()
 
-	fileInfo, err := file.Stat()
-	if err != nil {
+	if _, err := file.Stat(); err != nil {
 		return nil, fmt.Errorf("meta: stat video %s: %w", videoPath, err)
 	}
 
@@ -225,7 +223,6 @@ func (p *Publisher) uploadMultipart(ctx context.Context, endpoint, videoPath, de
 		return nil, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.ContentLength = fileInfo.Size() + int64(mw.BoundaryLength()) + 500 // approximate overhead
 
 	return p.HTTPClient.Do(req)
 }

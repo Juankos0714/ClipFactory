@@ -13,8 +13,8 @@ services:
       target: dev
     container_name: clipfactory-dev
     volumes:
-      # monta el código fuente del proyecto para development sin reconstruir
-      - ./app:/opt/clipfactory/app
+      # el código fuente llega por la imagen (COPY . . del Dockerfile). NO se
+      # monta ./app: la carpeta local 'app' está vacía y taparía el código.
       - ./config:/opt/clipfactory/config
       - ./credentials:/opt/clipfactory/credentials
       - ./data:/opt/clipfactory/data
@@ -63,7 +63,6 @@ services:
       target: dev
     container_name: clipfactory
     volumes:
-      - ./app:/opt/clipfactory/app
       - ./config:/opt/clipfactory/config
       - ./credentials:/opt/clipfactory/credentials
       - ./data:/opt/clipfactory/data
@@ -95,6 +94,55 @@ services:
       test: ["CMD", "/opt/clipfactory/bin/clipfactory", "status"]
       interval: 30s
       timeout: 15s
+      retries: 3
+      start_period: 2m
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # clipfactory-server: la API REST aditiva (comando 'server')
+  #
+  # Es un proceso SEPARADO del worker sobre la MISMA DB SQLite (WAL permite
+  # lecturas concurrentes). No ejecuta jobs: expone la DB y encola para que
+  # el worker los procese. CLIPFACTORY_API_ADDR decide dónde escucha; el
+  # token de operador es opcional (CLIPFACTORY_API_TOKEN).
+  # ------------------------------------------------------------------
+  clipfactory-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    container_name: clipfactory-server
+    volumes:
+      - ./config:/opt/clipfactory/config
+      - ./credentials:/opt/clipfactory/credentials
+      - ./data:/opt/clipfactory/data
+      - ./database:/opt/clipfactory/database
+      - ./logs:/opt/clipfactory/logs
+    environment:
+      - CLIPFACTORY_DATA_DIR=/opt/clipfactory/data
+      - CLIPFACTORY_DB_PATH=/opt/clipfactory/database/clipfactory.db
+      - CLIPFACTORY_LOG_DIR=/opt/clipfactory/logs
+      - CLIPFACTORY_CONFIG_DIR=/opt/clipfactory/config
+      - CLIPFACTORY_CREDENTIALS_DIR=/opt/clipfactory/credentials
+      - CLIPFACTORY_LOG_LEVEL=info
+      # API: dirección de escucha y CORS para el frontend. Descomentar para
+      # proteger la API (el frontend manda Authorization: Bearer <token>):
+      # - CLIPFACTORY_API_TOKEN=cambia-me
+      # - CLIPFACTORY_CORS_ORIGINS=https://tu-dominio.vercel.app,http://localhost:5173
+      - CLIPFACTORY_API_ADDR=:8080
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        cd /opt/clipfactory/app
+        CGO_ENABLED=0 go build -o /opt/clipfactory/bin/clipfactory ./cmd/clipfactory
+        exec /opt/clipfactory/bin/clipfactory server
+    ports:
+      - "8080:8080"
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
       retries: 3
       start_period: 2m
     restart: unless-stopped

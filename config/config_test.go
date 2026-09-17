@@ -176,6 +176,54 @@ func TestLoadConfigInvalidCredentialsFileIsFatal(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAPIFields(t *testing.T) {
+	setEnv(t, "CLIPFACTORY_API_ADDR", ":9099")
+	setEnv(t, "CLIPFACTORY_API_TOKEN", "secreto-operador")
+	setEnv(t, "CLIPFACTORY_CORS_ORIGINS", "http://localhost:5173, https://app.vercel.app ,")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.APIAddr != ":9099" {
+		t.Errorf("expected APIAddr ':9099', got '%s'", cfg.APIAddr)
+	}
+	if cfg.APIToken != "secreto-operador" {
+		t.Errorf("expected APIToken 'secreto-operador', got '%s'", cfg.APIToken)
+	}
+	want := []string{"http://localhost:5173", "https://app.vercel.app"}
+	if len(cfg.CORSOrigins) != len(want) {
+		t.Fatalf("expected %d CORS origins, got %v", len(want), cfg.CORSOrigins)
+	}
+	for i := range want {
+		if cfg.CORSOrigins[i] != want[i] {
+			t.Errorf("CORSOrigins[%d]: expected %q, got %q", i, want[i], cfg.CORSOrigins[i])
+		}
+	}
+}
+
+func TestGetEnvListFallbacks(t *testing.T) {
+	defaultList := []string{"http://localhost:5173"}
+
+	// variable ausente → default
+	os.Unsetenv("CLIPFACTORY_TEST_LIST")
+	if got := getEnvList("CLIPFACTORY_TEST_LIST", defaultList); len(got) != 1 || got[0] != defaultList[0] {
+		t.Errorf("expected default list, got %v", got)
+	}
+
+	// solo comas/espacios → default
+	setEnv(t, "CLIPFACTORY_TEST_LIST", " , , ")
+	if got := getEnvList("CLIPFACTORY_TEST_LIST", defaultList); len(got) != 1 || got[0] != defaultList[0] {
+		t.Errorf("expected default list for blank value, got %v", got)
+	}
+
+	// valor único sin espacios extra
+	setEnv(t, "CLIPFACTORY_TEST_LIST", "*")
+	if got := getEnvList("CLIPFACTORY_TEST_LIST", defaultList); len(got) != 1 || got[0] != "*" {
+		t.Errorf("expected ['*'], got %v", got)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	cfg := &Config{DataDir: "./data", DBPath: "./db.sqlite"}
 	if err := cfg.Validate(); err != nil {

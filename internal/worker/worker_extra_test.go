@@ -153,11 +153,14 @@ func TestStatusFields(t *testing.T) {
 	}
 }
 
-func TestExecuteUnknownJobType(t *testing.T) {
+func TestExecuteJobUnexpectedReferenceType(t *testing.T) {
 	w := newTestWorker(t, openTestDB(t))
 
-	// insertar un job real y lockearlo antes de ejecutarlo
-	job := &db.Job{Type: "no-existe", ReferenceID: 1, ReferenceType: "videos"}
+	// El schema v2 tiene CHECK(type IN (...)): un tipo realmente desconocido no
+	// puede llegar a la cola (el default de executeJob es inalcanzable por DB).
+	// Lo más cercano es un job válido cuyo handler no espera ese reference_type:
+	// debe marcar el job 'error', sin pánico.
+	job := &db.Job{Type: "download", ReferenceID: 1, ReferenceType: "videos"}
 	if err := db.EnqueueJob(w.db, job); err != nil {
 		t.Fatalf("enqueue job: %v", err)
 	}

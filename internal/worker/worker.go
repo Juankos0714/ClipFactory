@@ -32,14 +32,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/juankos0714/clipfactory/internal/adapter"
 	"github.com/juankos0714/clipfactory/internal/adapter/twitch"
@@ -106,15 +104,15 @@ type WorkerConfig struct {
 // DefaultWorkerConfig retorna la configuración por defecto para el hardware objetivo (i3-3220, 2 núcleos).
 func DefaultWorkerConfig(dbPath string) WorkerConfig {
 	return WorkerConfig{
-		DBPath:                   dbPath,
-		WorkerID:                 "worker-main",
-		MaxConcurrentJobs:        2, // 1 ffmpeg + 1 download: adecuado para el i3-3220 (2 núcleos)
-		PollInterval:             5 * time.Second,
+		DBPath:            dbPath,
+		WorkerID:          "worker-main",
+		MaxConcurrentJobs: 2, // 1 ffmpeg + 1 download: adecuado para el i3-3220 (2 núcleos)
+		PollInterval:      5 * time.Second,
 		// auto-discovery: la primera pasada no necesita el CLI 'discovery'
 		DiscoverOnStart:          true,
 		PollPublicationsInterval: 5 * time.Minute, // re-encolado automático de publishes
 		RetentionInterval:        24 * time.Hour,
-		RetentionMaxAge:          720 * time.Hour, // 30 días
+		RetentionMaxAge:          720 * time.Hour,    // 30 días
 		MinFreeDiskSpace:         1024 * 1024 * 1024, // 1GB
 	}
 }
@@ -1080,6 +1078,7 @@ func (w *Worker) executeThumbnail(ctx context.Context, job db.Job) error {
 //     jobs con created_at <= now, así que el job "duerme" hasta que vence el
 //     backoff/cuota. Complementa al job poll_publications (que re-encola
 //     publications sin job futuro, p.ej. tras un crash del worker).
+//
 // Reconciler es la capacidad opcional de un Publisher de BUSCAR publicaciones
 // ya hechas en la plataforma. La usa executePublish para reconciliar antes de
 // reintentar un upload: con la clave determinista cf-<clip>-<video> en la
@@ -1228,7 +1227,7 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 		// reintentar para siempre inundaría la cola y los logs).
 		if pub.Attempts+1 >= adapter.MaxPublishAttempts {
 			if updErr := db.UpdatePublicationStatus(w.db, pub.ID, "failed", "", "",
-					fmt.Sprintf("agotados %d intentos; última causa: %s", adapter.MaxPublishAttempts, upErr.Error()), nil, nil, true); updErr != nil {
+				fmt.Sprintf("agotados %d intentos; última causa: %s", adapter.MaxPublishAttempts, upErr.Error()), nil, nil, true); updErr != nil {
 				return fmt.Errorf("update publication (failed/max attempts): %w", updErr)
 			}
 			log.Printf("[worker] publication %d FALLÓ DEFINITIVAMENTE tras %d intentos: %v", pub.ID, adapter.MaxPublishAttempts, upErr)
@@ -1354,38 +1353,4 @@ func (w *Worker) Status() map[string]interface{} {
 		"max_concurrent": w.cfg.MaxConcurrentJobs,
 		"poll_interval":  w.cfg.PollInterval.String(),
 	}
-}
-
-// freeDiskSpace retorna el espacio libre en bytes en el directorio dado.
-// En Windows usa GetDiskFreeSpaceEx, en Unix usa statfs.
-func freeDiskSpace(path string) (int64, error) {
-	var free int64
-	if runtime.GOOS == "windows" {
-		// Windows: usar GetDiskFreeSpaceEx
-		kernel32 := syscall.NewLazyDLL("kernel32.dll")
-		getDiskFreeSpaceEx := kernel32.NewProc("GetDiskFreeSpaceExW")
-		pathPtr, err := syscall.UTF16PtrFromString(path)
-		if err != nil {
-			return 0, err
-		}
-		var freeBytesAvailable, totalNumberOfBytes, totalNumberOfFreeBytes int64
-		r1, _, err := getDiskFreeSpaceEx.Call(
-			uintptr(unsafe.Pointer(pathPtr)),
-			uintptr(unsafe.Pointer(&freeBytesAvailable)),
-			uintptr(unsafe.Pointer(&totalNumberOfBytes)),
-			uintptr(unsafe.Pointer(&totalNumberOfFreeBytes)),
-		)
-		if r1 == 0 {
-			return 0, fmt.Errorf("GetDiskFreeSpaceEx failed: %v", err)
-		}
-		free = freeBytesAvailable
-	} else {
-		// Unix/Linux: usar statfs
-		var stat syscall.Statfs_t
-		if err := syscall.Statfs(path, &stat); err != nil {
-			return 0, err
-		}
-		free = int64(stat.Bavail) * int64(stat.Bsize)
-	}
-	return free, nil
 }

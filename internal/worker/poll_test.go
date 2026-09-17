@@ -275,14 +275,15 @@ func TestPublishRoutesByPlatform(t *testing.T) {
 }
 
 // TestPublishUnknownPlatformFailsClear: una publication de una plataforma sin
-// publisher falla con mensaje claro (no pánico).
+// publisher falla con mensaje claro (no pánico). V2 solo admite youtube/meta
+// en el CHECK, así que usamos 'meta' sin publisher registrado en el worker.
 func TestPublishUnknownPlatformFailsClear(t *testing.T) {
 	conn := openTestDB(t)
 	w := newTestWorker(t, conn)
 	w.publishers = map[string]Publisher{"youtube": &fakePublisher{writeOutput: true}}
 
 	pubs := setupPublishChains(t, conn, t.TempDir(), 1)
-	if _, err := conn.Exec(`UPDATE publications SET platform='tiktok' WHERE id=?`, pubs[0].ID); err != nil {
+	if _, err := conn.Exec(`UPDATE publications SET platform='meta' WHERE id=?`, pubs[0].ID); err != nil {
 		t.Fatalf("update platform: %v", err)
 	}
 
@@ -298,7 +299,7 @@ func TestPublishUnknownPlatformFailsClear(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for platform without publisher")
 	}
-	if !strings.Contains(err.Error(), "tiktok") {
+	if !strings.Contains(err.Error(), "meta") {
 		t.Errorf("expected clear message mentioning platform, got: %v", err)
 	}
 }
@@ -356,13 +357,14 @@ func scID(t *testing.T, conn *sql.DB, platformClipID string) int64 {
 }
 
 // TestDiscoveryUnknownPlatformFailsClear: source de plataforma sin discoverer
-// falla con mensaje claro.
+// falla con mensaje claro. V2 solo admite twitch/kick en el CHECK, así que
+// usamos 'kick' sin discoverer registrado en el worker.
 func TestDiscoveryUnknownPlatformFailsClear(t *testing.T) {
 	conn := openTestDB(t)
 	w := newTestWorker(t, conn)
 	w.discoverers = map[string]Discoverer{"twitch": &fakeDiscoverer{}}
 
-	src := &db.Source{Platform: "vimeo", ChannelID: "x", ChannelName: "x", Active: true}
+	src := &db.Source{Platform: "kick", ChannelID: "x", ChannelName: "x", Active: true}
 	if err := db.UpsertSource(conn, src); err != nil {
 		t.Fatalf("upsert source: %v", err)
 	}
@@ -379,7 +381,7 @@ func TestDiscoveryUnknownPlatformFailsClear(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for platform without discoverer")
 	}
-	if !strings.Contains(err.Error(), "vimeo") {
+	if !strings.Contains(err.Error(), "kick") {
 		t.Errorf("expected clear message mentioning platform, got: %v", err)
 	}
 }

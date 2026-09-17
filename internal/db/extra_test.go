@@ -507,12 +507,12 @@ func TestPublicationWithNullFields(t *testing.T) {
 	clipID := createClip(t, db, videoID, "/tmp/clip.mp4")
 
 	// publicación con todos los campos opcionales en NULL
-	p := &Publication{ClipID: clipID, Platform: "tiktok", Status: "pending"}
+	p := &Publication{ClipID: clipID, Platform: "meta", Status: "pending"}
 	if err := InsertPublication(db, p); err != nil {
 		t.Fatalf("insert publication: %v", err)
 	}
 
-	pending, err := GetPendingPublications(db, "tiktok", 10)
+	pending, err := GetPendingPublications(db, "meta", 10)
 	if err != nil {
 		t.Fatalf("get pending publications: %v", err)
 	}

@@ -91,7 +91,9 @@ func setupPublishChains(t *testing.T, conn *sql.DB, dataDir string, n int) []*db
 	var pubs []*db.Publication
 	for i := 0; i < n; i++ {
 		clipID := fmt.Sprintf("ClipIDPub%d", i)
-		sc := &db.SourceClip{Platform: "twitch", PlatformClipID: clipID, SourceID: sourceID, Status: "completed"}
+		// 'downloaded' es el único estado de source_clips compatible con "ya hay
+		// video" (el schema v2 restringe status a detected/downloaded/skipped/error).
+		sc := &db.SourceClip{Platform: "twitch", PlatformClipID: clipID, SourceID: sourceID, Status: "downloaded"}
 		if err := db.UpsertSourceClip(conn, sc); err != nil {
 			t.Fatalf("upsert source clip %d: %v", i, err)
 		}

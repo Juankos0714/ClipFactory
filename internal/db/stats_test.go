@@ -100,8 +100,8 @@ func TestGetSourceClipStats(t *testing.T) {
 		t.Fatalf("upsert kick clip: %v", err)
 	}
 
-	// un estado "raro" (fuera del enum documentado): debe contarse igual
-	if _, err := db.Exec(`UPDATE source_clips SET status='raro' WHERE platform_clip_id='t4'`); err != nil {
+	// un estado extra que el fixture aún no usa (skipped): debe contarse igual
+	if _, err := db.Exec(`UPDATE source_clips SET status='skipped' WHERE platform_clip_id='t4'`); err != nil {
 		t.Fatalf("set odd status: %v", err)
 	}
 
@@ -115,8 +115,8 @@ func TestGetSourceClipStats(t *testing.T) {
 	if got["twitch"]["downloaded"] != 1 {
 		t.Errorf("twitch downloaded: expected 1, got %d", got["twitch"]["downloaded"])
 	}
-	if got["twitch"]["raro"] != 1 {
-		t.Errorf("twitch 'raro': expected 1 (datos mandan), got %d", got["twitch"]["raro"])
+	if got["twitch"]["skipped"] != 1 {
+		t.Errorf("twitch 'skipped': expected 1, got %d", got["twitch"]["skipped"])
 	}
 	if got["kick"]["detected"] != 1 {
 		t.Errorf("kick detected: expected 1, got %d", got["kick"]["detected"])

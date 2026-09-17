@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-ssr/
+coverage/
+*.local
+
+# Env local (los ejemplos sí se versionan)
+.env
+.env.*
+!.env.example
