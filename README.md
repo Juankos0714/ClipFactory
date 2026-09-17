@@ -185,6 +185,7 @@ Todo se configura con variables de entorno (ver `config/config.go`):
 | `CLIPFACTORY_LOG_LEVEL` | `info` | nivel de log |
 | `CLIPFACTORY_MAX_CONCURRENT_JOBS` | `NumCPU()` | jobs en paralelo |
 | `CLIPFACTORY_POLL_INTERVAL` | `5s` | intervalo de sondeo de la cola |
+| `CLIPFACTORY_WORKER_ID` | hostname | identidad del worker en `jobs.locked_by` |
 | `CLIPFACTORY_POLL_PUBLICATIONS_INTERVAL` | `5m` | cada cuánto el job `poll_publications` re-encola publishes pendientes |
 | `CLIPFACTORY_TWITCH_DOWNLOADER_PATH` | `TwitchDownloaderCLI` | ruta al binario de descarga de clips (ya instalado en la imagen Docker) |
 | `CLIPFACTORY_FFMPEG_PATH` | `ffmpeg` | ruta al binario ffmpeg (ya instalado en la imagen Docker) |
@@ -321,7 +322,8 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/app" -w /app \
    timeouts.
 3. **Driver `modernc.org/sqlite`** (SQLite puro en Go, sin CGO): el build es
    `CGO_ENABLED=0`, cross-compile trivial Windows→Linux, sin dependencias nativas.
-4. **`CGO_ENABLED=0`**: binario estático, fácil de copiar a `nico-server`.
+4. **`CGO_ENABLED=0`**: binario estático, fácil de copiar a `nico-server`
+   (deploy con Docker stage `prod` o binario+systemd: [Guía de Uso §12](docs/guia-de-uso.md#12-deploy-en-el-servidor-nico-server)).
 5. **ffmpeg con VAAPI y fallback a libx264**: en el i3-3220 no hay GPU útil, así que
    el fallback software es el camino normal; VAAPI queda para servidores con iGPU.
 6. **Una fila de `publications` por plataforma**: un fallo en YouTube no bloquea a

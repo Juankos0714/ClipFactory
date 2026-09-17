@@ -114,8 +114,11 @@ type Clip struct {
 // en una plataforma no bloquea ni reinicia a las otras, y cada una mantiene su
 // propio backoff con Attempts + NextRetryAt.
 //
-// Estados: pending → published | error | waiting_rate_limit.
-// UpdatePublicationStatus incrementa Attempts en cada intento.
+// Estados: pending → published | error | waiting_rate_limit | failed.
+// 'failed' es dead-letter: error permanente (credenciales/permisos) o techo
+// de intentos (MaxPublishAttempts) alcanzado — NO se re-encola más
+// (GetPendingPublications lo excluye). UpdatePublicationStatus incrementa
+// Attempts en cada intento.
 type Publication struct {
 	ID           int64
 	ClipID       int64  // FK a clips

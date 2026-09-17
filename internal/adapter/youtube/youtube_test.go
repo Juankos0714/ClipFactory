@@ -21,6 +21,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/juankos0714/clipfactory/internal/adapter"
 )
 
 // newTestServer arma un Publisher + servidor fake de Google y devuelve también
@@ -342,6 +344,10 @@ func TestUploadInitWithoutLocation(t *testing.T) {
 }
 
 func TestTokenEndpointError(t *testing.T) {
+	// OJO: el fake devuelve {"error": "invalid_client"} para cualquier status
+	// != 200, así que este caso clasifica PERMANENTE (invalid_client =
+	// credenciales incorrectas). La aserción 'auth' sigue pasando porque el
+	// error llega envuelto como "youtube: auth: ...".
 	fg := &fakeGoogle{tokenStatus: http.StatusUnauthorized}
 	p, _ := newTestPublisher(t, fg)
 	video := newTestVideo(t)
@@ -352,5 +358,30 @@ func TestTokenEndpointError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "auth") {
 		t.Errorf("expected 'auth' in error chain, got: %v", err)
+	}
+	// y además debe ser permanente: invalid_client no se arregla reintentando
+	var pe *adapter.PermanentError
+	if !errors.As(err, &pe) {
+		t.Fatalf("invalid_client debe clasificarse permanente, got %T: %v", err, err)
+	}
+}
+
+func TestUploadPermanentUnauthorized(t *testing.T) {
+	// 401 en el upload → permanente (token revocado a mitad de sesión)
+	fg := &fakeGoogle{finalStatus: http.StatusUnauthorized, finalBody: `{"error": {"errors": [{"reason": "unauthorized"}]}}`}
+	p, _ := newTestPublisher(t, fg)
+	video := newTestVideo(t)
+
+	_, _, err := p.UploadVideo(context.Background(), video, "t", "", nil)
+	if err == nil {
+		t.Fatal("expected error for 401 upload")
+	}
+	var pe *adapter.PermanentError
+	if !errors.As(err, &pe) {
+		t.Fatalf("401 debe clasificarse *adapter.PermanentError, got %T: %v", err, err)
+	}
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		t.Errorf("401 no debe clasificarse como rate limit: %v", err)
 	}
 }

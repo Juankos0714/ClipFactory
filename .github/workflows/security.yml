@@ -1,0 +1,59 @@
+# Seguridad: análisis estático (gosec) y vulnerabilidades en dependencias
+# (govulncheck). Semanal + manual: no bloquea cada push (ruido), pero ningún
+# CVE nuevo en dependencias pasa más de 7 días sin ser detectado.
+#
+# gosec sobre un MVP genera hallazgos de ruido bajo (G104, G304...): corre
+# sin fallar y sube los resultados como SARIF al tab Security de GitHub para
+# triage; si el repo tiene Code Scanning activo, aparecen anotados en los PRs.
+name: Security
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # lunes 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gosec:
+    name: gosec (análisis estático)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Run gosec
+        uses: securego/gosec@master
+        with:
+          args: ./... -exclude=G104 -no-fail -fmt sarif -out gosec.sarif
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec.sarif
+
+  govulncheck:
+    name: govulncheck (CVEs en dependencias)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      # govulncheck SÍ falla el job: un CVE alcanzable en dependencias es
+      # accionable de inmediato (a diferencia del ruido de gosec)
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

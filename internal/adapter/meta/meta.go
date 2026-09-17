@@ -38,6 +38,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/juankos0714/clipfactory/internal/adapter"
 )
 
 // DefaultGraphURL es la URL base de la Graph API de Meta.
@@ -172,45 +174,68 @@ func (p *Publisher) UploadVideo(ctx context.Context, videoPath, title, descripti
 
 // uploadMultipart hace el upload directo del archivo (multipart/form-data,
 // campo "source" según la documentación de la Graph API de videos).
+// Usa streaming: el archivo se lee desde disco y se escribe al request sin
+// cargarlo completo en memoria.
 func (p *Publisher) uploadMultipart(ctx context.Context, endpoint, videoPath, description string) (*http.Response, error) {
-	data, err := os.ReadFile(videoPath)
+	file, err := os.Open(videoPath)
 	if err != nil {
-		return nil, fmt.Errorf("meta: leer video %s: %w", videoPath, err)
+		return nil, fmt.Errorf("meta: abrir video %s: %w", videoPath, err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("meta: stat video %s: %w", videoPath, err)
 	}
 
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	if err := mw.WriteField("upload_type", "reel"); err != nil {
-		return nil, err
-	}
-	if err := mw.WriteField("description", description); err != nil {
-		return nil, err
-	}
-	if err := mw.WriteField("access_token", p.AccessToken); err != nil {
-		return nil, err
-	}
-	fw, err := mw.CreateFormFile("source", filepath.Base(videoPath))
-	if err != nil {
-		return nil, err
-	}
-	if _, err := fw.Write(data); err != nil {
-		return nil, err
-	}
-	if err := mw.Close(); err != nil {
-		return nil, err
-	}
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &buf)
+	go func() {
+		defer pw.Close()
+		defer mw.Close()
+
+		if err := mw.WriteField("upload_type", "reel"); err != nil {
+			pw.CloseWithError(fmt.Errorf("write upload_type: %w", err))
+			return
+		}
+		if err := mw.WriteField("description", description); err != nil {
+			pw.CloseWithError(fmt.Errorf("write description: %w", err))
+			return
+		}
+		if err := mw.WriteField("access_token", p.AccessToken); err != nil {
+			pw.CloseWithError(fmt.Errorf("write access_token: %w", err))
+			return
+		}
+
+		fw, err := mw.CreateFormFile("source", filepath.Base(videoPath))
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("create form file: %w", err))
+			return
+		}
+
+		if _, err := io.Copy(fw, file); err != nil {
+			pw.CloseWithError(fmt.Errorf("copy file to form: %w", err))
+			return
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pr)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.ContentLength = fileInfo.Size() + int64(mw.BoundaryLength()) + 500 // approximate overhead
+
 	return p.HTTPClient.Do(req)
 }
 
 // classifyHTTPError convierte errores HTTP de la Graph API en errores con la
 // señal que el worker necesita: los códigos 4/17/32/613 son rate limit
-// (transitorios → backoff), el resto son errores genéricos.
+// (transitorios → backoff), 401/403 → permanentes (token inválido/expirado o
+// sin permisos sobre la página: reintentar no los arregla, el operador debe
+// renovar el token) y el resto queda genérico = TRANSITORIO (con techo
+// MaxPublishAttempts en el worker; conservador: no clasificar de más).
 func (p *Publisher) classifyHTTPError(status int, body []byte) error {
 	raw := strings.TrimSpace(string(body))
 	var ge graphError
@@ -220,6 +245,12 @@ func (p *Publisher) classifyHTTPError(status int, body []byte) error {
 		case 4, 17, 32, 613: // "application limit reached", "user requests", "temporary issue"
 			return &RateLimitError{Detail: raw}
 		}
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return adapter.NewPermanentError(fmt.Sprintf("HTTP 401: %s", raw))
+	case http.StatusForbidden:
+		return adapter.NewPermanentError(fmt.Sprintf("HTTP 403: %s", raw))
 	}
 	return fmt.Errorf("meta: api devolvió %d: %s", status, raw)
 }

@@ -5,6 +5,7 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+
+	"github.com/juankos0714/clipfactory/internal/adapter"
 )
 
 // writeTempVideo crea un archivo de video falso para los uploads.
@@ -144,6 +147,45 @@ func TestAPIErrorGeneric(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "código 100") {
 		t.Errorf("expected graph error code in message, got: %v", err)
+	}
+}
+
+func TestAPIErrorPermanent(t *testing.T) {
+	// 401: token inválido/expirado → permanente, NO rate limit
+	p401, _ := newTestPublisher(t, http.StatusUnauthorized, `{"error":{"message":"Invalid OAuth access token","type":"OAuthException","code":190}}`, nil)
+	_, _, err := p401.UploadVideo(context.Background(), writeTempVideo(t), "", "", nil)
+	if err == nil {
+		t.Fatal("expected error for 401")
+	}
+	var rle401 *RateLimitError
+	if asRateLimit(err, &rle401) {
+		t.Errorf("401 no debe clasificarse como rate limit: %v", err)
+	}
+	var pe401 *adapter.PermanentError
+	if !errors.As(err, &pe401) {
+		t.Fatalf("401 debe clasificarse como *adapter.PermanentError, got %T: %v", err, err)
+	}
+
+	// 403: sin permisos sobre la página → permanente también
+	p403, _ := newTestPublisher(t, http.StatusForbidden, `{"error":{"message":"Requires pages_manage_videos","type":"OAuthException","code":200}}`, nil)
+	_, _, err = p403.UploadVideo(context.Background(), writeTempVideo(t), "", "", nil)
+	if err == nil {
+		t.Fatal("expected error for 403")
+	}
+	var pe403 *adapter.PermanentError
+	if !errors.As(err, &pe403) {
+		t.Fatalf("403 debe clasificarse como *adapter.PermanentError, got %T: %v", err, err)
+	}
+
+	// 500: transitorio (sin clasificar) — el techo del worker lo acota
+	p500, _ := newTestPublisher(t, http.StatusInternalServerError, `oops`, nil)
+	_, _, err = p500.UploadVideo(context.Background(), writeTempVideo(t), "", "", nil)
+	if err == nil {
+		t.Fatal("expected error for 500")
+	}
+	var pe500 *adapter.PermanentError
+	if errors.As(err, &pe500) {
+		t.Errorf("500 no debe ser permanente: %v", err)
 	}
 }
 

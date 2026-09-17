@@ -1,0 +1,30 @@
+# Secrets y credenciales — NUNCA commitear archivos reales
+credentials/
+!credentials/*.conf.example
+*.env
+.env
+.env.*
+!.env.example
+
+# Estado en runtime: la base operacional NO va versionada (jobs, sources,
+# clips, publications...). El directorio se mantiene con database/.gitkeep.
+database/*.db
+database/*.db-shm
+database/*.db-wal
+
+# Datos del pipeline (videos, clips, thumbnails)
+data/
+
+# Logs
+logs/
+
+# Temporales
+tmp/
+
+# Go
+coverage.out
+*.test
+
+# OS
+.DS_Store
+Thumbs.db

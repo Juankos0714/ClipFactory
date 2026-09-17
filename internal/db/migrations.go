@@ -188,7 +188,145 @@ var migrationSteps = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at)`,
 		},
 	},
-	// Próxima migración: {Version: 2, Name: "...", SQL: []string{...}} — nunca
+	{
+		Version: 2,
+		Name:    "add_check_constraints",
+		SQL: []string{
+			// Recrear sources con CHECK constraint
+			`CREATE TABLE sources_new (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				platform TEXT NOT NULL CHECK (platform IN ('twitch', 'kick')),
+				channel_id TEXT NOT NULL,
+				channel_name TEXT NOT NULL,
+				active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+				last_checked_at TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+			)`,
+			`INSERT INTO sources_new (id, platform, channel_id, channel_name, active, last_checked_at, created_at, updated_at)
+			 SELECT id, platform, channel_id, channel_name, active, last_checked_at, created_at, updated_at FROM sources`,
+			`DROP TABLE sources`,
+			`ALTER TABLE sources_new RENAME TO sources`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_platform_channel ON sources(platform, channel_id)`,
+
+			// Recrear source_clips con CHECK constraint
+			`CREATE TABLE source_clips_new (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				platform TEXT NOT NULL CHECK (platform IN ('twitch', 'kick')),
+				platform_clip_id TEXT NOT NULL,
+				source_id INTEGER NOT NULL,
+				title TEXT,
+				duration_seconds REAL,
+				created_at_platform TEXT,
+				status TEXT NOT NULL DEFAULT 'detected' CHECK (status IN ('detected', 'downloaded', 'skipped', 'error')),
+				error_message TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+				FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+			)`,
+			`INSERT INTO source_clips_new (id, platform, platform_clip_id, source_id, title, duration_seconds, created_at_platform, status, error_message, created_at, updated_at)
+			 SELECT id, platform, platform_clip_id, source_id, title, duration_seconds, created_at_platform, status, error_message, created_at, updated_at FROM source_clips`,
+			`DROP TABLE source_clips`,
+			`ALTER TABLE source_clips_new RENAME TO source_clips`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_clips_platform_id ON source_clips(platform, platform_clip_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_source_clips_source ON source_clips(source_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_source_clips_status ON source_clips(status)`,
+
+			// Recrear videos con CHECK constraint
+			`CREATE TABLE videos_new (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				source_clip_id INTEGER NOT NULL,
+				filepath TEXT NOT NULL UNIQUE,
+				duration_seconds REAL,
+				width INTEGER,
+				height INTEGER,
+				file_hash TEXT,
+				status TEXT NOT NULL DEFAULT 'incoming' CHECK (status IN ('incoming', 'processing', 'completed', 'failed')),
+				error_message TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+				FOREIGN KEY (source_clip_id) REFERENCES source_clips(id) ON DELETE CASCADE
+			)`,
+			`INSERT INTO videos_new (id, source_clip_id, filepath, duration_seconds, width, height, file_hash, status, error_message, created_at, updated_at)
+			 SELECT id, source_clip_id, filepath, duration_seconds, width, height, file_hash, status, error_message, created_at, updated_at FROM videos`,
+			`DROP TABLE videos`,
+			`ALTER TABLE videos_new RENAME TO videos`,
+			`CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status)`,
+			`CREATE INDEX IF NOT EXISTS idx_videos_source_clip ON videos(source_clip_id)`,
+
+			// Recrear clips con CHECK constraint
+			`CREATE TABLE clips_new (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				video_id INTEGER NOT NULL,
+				start_time_seconds REAL NOT NULL,
+				end_time_seconds REAL NOT NULL,
+				filepath TEXT NOT NULL UNIQUE,
+				thumbnail_path TEXT,
+				duration_seconds REAL,
+				width INTEGER,
+				height INTEGER,
+				status TEXT NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'completed', 'failed')),
+				error_message TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+				FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+			)`,
+			`INSERT INTO clips_new (id, video_id, start_time_seconds, end_time_seconds, filepath, thumbnail_path, duration_seconds, width, height, status, error_message, created_at, updated_at)
+			 SELECT id, video_id, start_time_seconds, end_time_seconds, filepath, thumbnail_path, duration_seconds, width, height, status, error_message, created_at, updated_at FROM clips`,
+			`DROP TABLE clips`,
+			`ALTER TABLE clips_new RENAME TO clips`,
+			`CREATE INDEX IF NOT EXISTS idx_clips_status ON clips(status)`,
+			`CREATE INDEX IF NOT EXISTS idx_clips_video ON clips(video_id)`,
+
+			// Recrear publications con CHECK constraint
+			`CREATE TABLE publications_new (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				clip_id INTEGER NOT NULL,
+				platform TEXT NOT NULL CHECK (platform IN ('youtube', 'meta')),
+				status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'error', 'waiting_rate_limit', 'failed')),
+				attempts INTEGER NOT NULL DEFAULT 0,
+				next_retry_at TEXT,
+				external_id TEXT,
+				external_url TEXT,
+				error_message TEXT,
+				published_at TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+				FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
+			)`,
+			`INSERT INTO publications_new (id, clip_id, platform, status, attempts, next_retry_at, external_id, external_url, error_message, published_at, created_at, updated_at)
+			 SELECT id, clip_id, platform, status, attempts, next_retry_at, external_id, external_url, error_message, published_at, created_at, updated_at FROM publications`,
+			`DROP TABLE publications`,
+			`ALTER TABLE publications_new RENAME TO publications`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_clip_platform ON publications(clip_id, platform)`,
+			`CREATE INDEX IF NOT EXISTS idx_publications_status ON publications(status)`,
+			`CREATE INDEX IF NOT EXISTS idx_publications_next_retry ON publications(next_retry_at)`,
+
+			// Recrear jobs con CHECK constraint
+			`CREATE TABLE jobs_new (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				type TEXT NOT NULL CHECK (type IN ('discovery', 'download', 'process', 'thumbnail', 'publish', 'poll_publications')),
+				reference_id INTEGER NOT NULL,
+				reference_type TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'done', 'error')),
+				attempts INTEGER NOT NULL DEFAULT 0,
+				locked_at TEXT,
+				locked_by TEXT,
+				error_message TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+			)`,
+			`INSERT INTO jobs_new (id, type, reference_id, reference_type, status, attempts, locked_at, locked_by, error_message, created_at, updated_at)
+			 SELECT id, type, reference_id, reference_type, status, attempts, locked_at, locked_by, error_message, created_at, updated_at FROM jobs`,
+			`DROP TABLE jobs`,
+			`ALTER TABLE jobs_new RENAME TO jobs`,
+			`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)`,
+			`CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type)`,
+			`CREATE INDEX IF NOT EXISTS idx_jobs_reference ON jobs(reference_type, reference_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_jobs_locked ON jobs(locked_at)`,
+		},
+	},
+	// Próxima migración: {Version: 3, Name: "...", SQL: []string{...}} — nunca
 	// modificar la v1: las DBs existentes ya la tienen aplicada.
 }
 

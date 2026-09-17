@@ -302,9 +302,11 @@ resumable init (metadatos) → `Location` header (session URL) → PUT con bytes
     TwitchDownloaderCLI. El código se monta por volumen (docker-compose) y el
     binario se compila a `/opt/clipfactory/bin` (fuera del volumen) para que
     editar código no requiera rebuild de imagen.
-  - `prod`: lo mínimo para correr. (Hoy el deploy real copia el binario
-    compilado a nico-server; el stage prod queda preparado para un futuro
-    imagen de producción.)
+  - `prod`: imagen de producción autocontenida — compila el binario dentro
+    (`-trimpath -ldflags "-s -w"`) y su `ENTRYPOINT` es directamente el CLI
+    (`CMD ["worker"]`), así que el worker corre como PID 1 y recibe el
+    SIGTERM del `docker stop` (con `--stop-timeout 90`). Es la vía de deploy
+    documentada en [Guía de Uso §12.1](guia-de-uso.md).
 - **PowerShell en `scripts/`**: el desarrollador trabaja en Windows; los
   scripts (`run-cli.ps1`, `test.ps1`, `build.ps1`...) envuelven los comandos
   docker con las rutas y flags correctos (`MSYS_NO_PATHCONV=1` en bash para
@@ -319,7 +321,7 @@ contrato operativo del pipeline: cualquier estado raro es visible y explicable.
 source_clips:  detected ──► downloaded ──► (skipped | error)
 videos:        incoming ──► processing ──► (completed | failed)
 clips:         processing ──► (completed | failed)   [thumbnail es un adjunto, no cambia status]
-publications:  pending ──► (published | error | waiting_rate_limit)
+publications:  pending ──► (published | error | waiting_rate_limit | failed)
 jobs:          queued ──► running ──► (done | error)
 ```
 
@@ -333,11 +335,35 @@ Notas finas:
 - `publications: waiting_rate_limit` NO incrementa `attempts` — la cuota de
   YouTube agotada no es culpa del clip; el backoff exponencial queda reservado
   para fallos reales del pipeline.
+- `publications: failed` es DEAD-LETTER (no se re-encola: GetPendingPublications
+  lo excluye). Llega a ese estado por dos caminos (clasificación en
+  `internal/adapter/retry.go`): (1) error PERMANENTE (401/403 de la API,
+  invalid_grant/invalid_client en el token endpoint — credenciales/permisos
+  que un reintento no arregla) en el primer intento; (2) techo
+  `adapter.MaxPublishAttempts` (10) alcanzado tras backoff exponencial de
+  errores transitorios. Lo no clasificado se asume transitorio (conservador:
+  el techo acota el daño). Recuperar una publication 'failed' es manual:
+  corregir la causa y resetear status/attempts con SQL.
+- IDEMPOTENCIA EXTERNA (anti-duplicados en la plataforma): ni YouTube ni Meta
+  soportan idempotency keys en uploads, así que la protección es
+  RECONCILIACIÓN. Cada video se publica con un marker determinista
+  `cf-<clipID>-<videoID>` en la descripción (`db.PublicationKeysForClip`) y,
+  antes de un reintento (attempts > 0), `executePublish` busca ese marker
+  entre los últimos 50 uploads vía `worker.Reconciler.FindRecentByMarker`
+  (YouTube: channels.list + playlistItems.list, lectura sin cuota; Meta: GET
+  /{page}/videos). Si lo encuentra, el crash fue POST-upload: registra el
+  external_id y NO vuelve a subir. Si la consulta falla, sube igual (fail-open:
+  el techo de intentos limita el daño).
 - `jobs` en `error` NO se re-encolan automáticamente: el reintento de las
   publications lo hacen (1) el job futuro que `executePublish` encola con
   `created_at = next_retry_at` y (2) el `poll_publications` periódico como red
   de seguridad. Los demás jobs se re-encolan a mano insertando un job nuevo
   (idempotente por diseño).
+- EXCEPCIÓN al punto anterior: un 429 de Twitch durante `discovery` NO marca
+  el job 'error' — `executeDiscovery` re-encola el job con
+  `created_at = now + Retry-After` (default 60s; ver
+  `internal/adapter/twitch/ratelimit.go`) y termina 'done'. El rate limit no
+  es un fallo del canal; `last_checked_at` no avanza en esa pasada.
 
 ## 5. Manejo de errores y reintentos
 
@@ -410,6 +436,12 @@ Principio: **fallar temprano en arranque, fallar suave en runtime**.
   vuelo) tras aplicar sources.yaml. El worker es quien ejecuta la pasada; de
   hecho, con el auto-discovery al arrancar (ver arriba) normalmente ni hace
   falta invocarlo.
+- **CI/CD implementado** ✅ (`.github/workflows/`): `ci.yml` (vet, gofmt,
+  build, test, **test -race** y build del stage prod en cada PR/push);
+  `docker.yml` (push a main publica la imagen prod a GHCR con tags
+  `sha-<sha>` + `latest`); `security.yml` (semanal: gosec en modo triage vía
+  SARIF + govulncheck bloqueante). El checklist completo de hardening y su
+  estado vive en `docs/hardening-checklist.md`.
 - **Re-encolado de publications implementado** ✅: dos mecanismos
   complementarios: (1) `executePublish` programa el siguiente intento encolando
   un job `publish` con `created_at = next_retry_at` (el scheduler solo ofrece
@@ -447,6 +479,12 @@ Principio: **fallar temprano en arranque, fallar suave en runtime**.
   vuelo) tras aplicar sources.yaml. El worker es quien ejecuta la pasada; de
   hecho, con el auto-discovery al arrancar (ver arriba) normalmente ni hace
   falta invocarlo.
+- **CI/CD implementado** ✅ (`.github/workflows/`): `ci.yml` (vet, gofmt,
+  build, test, **test -race** y build del stage prod en cada PR/push);
+  `docker.yml` (push a main publica la imagen prod a GHCR con tags
+  `sha-<sha>` + `latest`); `security.yml` (semanal: gosec en modo triage vía
+  SARIF + govulncheck bloqueante). El checklist completo de hardening y su
+  estado vive en `docs/hardening-checklist.md`.
 
 ---
 

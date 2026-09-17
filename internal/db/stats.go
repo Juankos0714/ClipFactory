@@ -15,6 +15,35 @@ import (
 	"fmt"
 )
 
+// PublicationKeysForClip devuelve los marcadores deterministas de publicación
+// para un clip: "cf-<clipID>-<videoID>" y "cf-<clipID>". Es la CLAVE DE
+// RECONCILIACIÓN anti-duplicados: se inserta en la descripción/detalle del
+// video publicado y, antes de reintentar un upload, el publisher la busca
+// entre los videos publicados recientemente en la plataforma. Si aparece, el
+// upload YA SUCEDIÓ (crash entre upload y update de DB) y NO se repite.
+//
+// Determinista: no depende del reloj ni del orden de reintentos, así que el
+// reintento encuentra lo que subió el intento anterior, sin importar cuándo.// Incluye videoID (y no solo clipID) porque un mismo clip puede re-procesarse
+// y generar otra fila de video; el marcador con ambos identifica exactamente
+// el artefacto publicado.
+func PublicationKeysForClip(clipID, videoID int64) []string {
+	return []string{
+		fmt.Sprintf("cf-%d-%d", clipID, videoID),
+		fmt.Sprintf("cf-%d", clipID),
+	}
+}
+
+// GetVideoIDByClipID devuelve el video de origen de un clip (getter liviano
+// para armar los marcadores de reconciliación). 0 si no existe.
+func GetVideoIDByClipID(db *sql.DB, clipID int64) (int64, error) {
+	var videoID int64
+	err := db.QueryRow(`SELECT video_id FROM clips WHERE id = ?`, clipID).Scan(&videoID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return videoID, err
+}
+
 // GetSourceStats devuelve la cantidad de canales por plataforma, separados
 // entre activos (el discovery los consulta) e inactivos (pausados).
 //
@@ -123,7 +152,7 @@ func countByStatus(db *sql.DB, table string) (map[string]int, error) {
 }
 
 // GetPublicationStats devuelve la cantidad de publications por plataforma y
-// estado (pending, published, error, waiting_rate_limit). Es la vista del lado
+// estado (pending, published, error, waiting_rate_limit, failed). Es la vista del lado
 // "destino": cuántos clips se publicaron y cuántos están en backoff por
 // plataforma.
 func GetPublicationStats(db *sql.DB) (map[string]map[string]int, error) {

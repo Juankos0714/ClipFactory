@@ -474,10 +474,144 @@ docker compose exec clipfactory-dev bash -c "cd /opt/clipfactory/app && CGO_ENAB
 
 ## 12. Deploy en el servidor (nico-server)
 
+Dos caminos posibles, elige UNO:
+
+- **12.1 Docker (stage `prod`)** — recomendado: imagen autocontenida con
+  ffmpeg, .NET y TwitchDownloaderCLI ya instalados dentro. Mismo entorno que
+  testaste en desarrollo.
+- **12.2 Binario + systemd** — sin Docker: compila el binario estático y lo
+  corre systemd directamente.
+
+En ambos casos, en el servidor se necesita:
+
+```bash
+# estructura de directorios (una vez)
+ssh usuario@nico-server
+sudo mkdir -p /opt/clipfactory/{config,credentials,database,logs,data/{incoming,processing,completed,failed,thumbnails}}
+
+# credenciales (desde tu máquina Windows)
+scp credentials/*.conf usuario@nico-server:/opt/clipfactory/credentials/
+ssh usuario@nico-server "chmod 600 /opt/clipfactory/credentials/*.conf"
+
+# sources.yaml (canales a monitorear)
+scp config/sources.yaml usuario@nico-server:/opt/clipfactory/config/
+```
+
+### 12.1 Vía Docker (stage `prod` del Dockerfile)
+
+#### a) Construir la imagen
+
+Desde tu máquina Windows (o en el servidor, si clona el repo):
+
+```bash
+docker build --target prod -t clipfactory:prod .
+```
+
+La imagen incluye: binario compilado (CGO_ENABLED=0, `-trimpath -ldflags
+"-s -w"`), ffmpeg, .NET 8 runtime + TwitchDownloaderCLI. El `ENTRYPOINT` es
+directamente el CLI con `CMD ["worker"]`.
+
+#### b) Transferir la imagen al servidor
+
+Si nico-server no tiene acceso al registry/BuildKit:
+
+```bash
+docker save clipfactory:prod | gzip > clipfactory-prod.tar.gz
+scp clipfactory-prod.tar.gz usuario@nico-server:/tmp/
+ssh usuario@nico-server "docker load < /tmp/clipfactory-prod.tar.gz && rm /tmp/clipfactory-prod.tar.gz"
+```
+
+#### c) Correr el worker
+
+```bash
+ssh usuario@nico-server
+
+docker run -d \
+  --name clipfactory \
+  --restart unless-stopped \
+  --stop-timeout 90 \
+  -v /opt/clipfactory/config:/opt/clipfactory/config \
+  -v /opt/clipfactory/credentials:/opt/clipfactory/credentials:ro \
+  -v /opt/clipfactory/data:/opt/clipfactory/data \
+  -v /opt/clipfactory/database:/opt/clipfactory/database \
+  -v /opt/clipfactory/logs:/opt/clipfactory/logs \
+  clipfactory:prod
+```
+
+Detalles importantes:
+
+- **`--stop-timeout 90`**: `docker stop` espera hasta 90s al apagado graceful
+  (jobs en curso re-encolados, DB cerrada limpia, exit 0). Para más margen
+  puntual: `docker stop -t 300 clipfactory`.
+- **`:ro` en credentials**: el worker solo las lee. Si el volumen está
+  read-only, un bug no puede sobrescribir secretos.
+- **no-root**: el contenedor corre como el usuario `clipfactory` (uid
+  10001, fijado en el Dockerfile). Los volúmenes del host deben ser
+  escribibles por ese uid: `chown -R 10001:10001
+  /opt/clipfactory/{data,database,logs}` una vez antes del primer
+  `docker run` (config y credentials pueden quedarse root-owned: solo se
+  leen). Si el contenedor arranca y muere con `attempt to write a readonly
+  database`, el ownership de los volúmenes es lo primero que hay que mirar.
+- **auto-discovery**: al arrancar encola discovery de los canales activos
+  (`CLIPFACTORY_DISCOVER_ON_START=false` para desactivarlo, igual que en dev).
+- **logs**: `docker logs -f clipfactory` (también quedan en
+  `/opt/clipfactory/logs/`).
+
+#### d) Healthcheck (opcional pero recomendado)
+
+```bash
+docker run -d \
+  ... (igual que arriba) ... \
+  --health-cmd "/opt/clipfactory/bin/clipfactory status" \
+  --health-interval 30s \
+  --health-timeout 15s \
+  --health-retries 3 \
+  --health-start-period 15s \
+  clipfactory:prod
+```
+
+`docker ps` mostrará `(healthy)`/`(unhealthy)`: el check es una lectura
+SQLite barata que no toca la cola.
+
+#### e) Upgrade a una nueva versión
+
+```bash
+# en tu máquina Windows, con el código nuevo:
+docker build --target prod -t clipfactory:prod .
+docker save clipfactory:prod | gzip > clipfactory-prod.tar.gz
+scp clipfactory-prod.tar.gz usuario@nico-server:/tmp/
+
+# en el servidor:
+docker load < /tmp/clipfactory-prod.tar.gz
+docker stop clipfactory        # graceful: jobs en curso se re-encolan
+docker rm clipfactory
+docker run -d ... clipfactory:prod   # (mismas flags que c)
+```
+
+Al rearrancar, el worker aplica migraciones pendientes y re-encola los jobs
+que quedaron en vuelo del apagado (y los huérfanos de un kill -9, por el
+stale-lock de 30s).
+
+#### f) Rollback
+
+Conservá la imagen anterior con tag:
+
+```bash
+docker tag clipfactory:prod clipfactory:prod-2026-09-16   # antes del upgrade
+docker run -d ... clipfactory:prod-2026-09-16             # si hay que volver
+```
+
+La DB es compatible hacia adelante (migraciones versionadas): si la versión
+nueva migró el esquema, una versión vieja puede rechazarla — por eso el
+rollback de código con DB migrada es "última opción"; primero intentá
+arreglar hacia adelante.
+
+### 12.2 Vía binario + systemd (sin Docker)
+
 1. **Compilar en Linux** (en el contenedor o en el propio servidor):
 
    ```bash
-   CGO_ENABLED=0 go build -o clipfactory ./cmd/clipfactory
+   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o clipfactory ./cmd/clipfactory
    ```
 
    El binario es estático: se copia tal cual.
@@ -498,7 +632,7 @@ docker compose exec clipfactory-dev bash -c "cd /opt/clipfactory/app && CGO_ENAB
    sudo mv tdl/TwitchDownloaderCLI /usr/local/bin/
    ```
 
-4. **Copiar credenciales** (`twitch.conf`, `youtube.conf`) a
+4. **Copiar credenciales** (`twitch.conf`, `youtube.conf`, `meta.conf`) a
    `/opt/clipfactory/credentials/` con permisos restringidos:
 
    ```bash
@@ -516,6 +650,8 @@ docker compose exec clipfactory-dev bash -c "cd /opt/clipfactory/app && CGO_ENAB
    [Service]
    WorkingDirectory=/opt/clipfactory/app
    ExecStart=/opt/clipfactory/bin/clipfactory worker
+   # SIGTERM → apagado graceful (jobs re-encolados); tras el timeout, SIGKILL
+   TimeoutStopSec=90
    Restart=on-failure
    RestartSec=10
 
@@ -528,9 +664,13 @@ docker compose exec clipfactory-dev bash -c "cd /opt/clipfactory/app && CGO_ENAB
    journalctl -u clipfactory -f        # seguir el log
    ```
 
-6. **Backups**: copiar `database/clipfactory.db` (y el `-wal`/`-shm`
-   mientras corre) con periodicidad diaria. Los videos son regenerables; la
-   DB no (tiene el historial de publications y sus `external_id`).
+### Backups (ambas vías)
+
+Copiar `database/clipfactory.db` (y el `-wal`/`-shm` mientras corre) con
+periodicidad diaria. Los videos son regenerables; la DB no (tiene el historial
+de publications y sus `external_id`). Si el worker corre en Docker, detenerlo
+un momento antes del backup garantiza consistencia total; si no, el
+`-wal` captura las últimas transacciones.
 
 ---
 

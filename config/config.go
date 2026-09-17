@@ -27,6 +27,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Config representa la configuración completa de ClipFactory.
@@ -47,6 +49,10 @@ type Config struct {
 	// --- Worker ---
 	MaxConcurrentJobs int           // jobs en paralelo (default: NumCPU)
 	PollInterval      time.Duration // frecuencia de sondeo de la cola (default: 5s)
+	WorkerID          string        // identidad en jobs.locked_by (default: hostname;
+	//                                  CLIPFACTORY_WORKER_ID para override). Único
+	//                                  por proceso: varios workers sobre la misma DB
+	//                                  no deben compartir identidad de lock.
 
 	// Sources: canales a monitorear, cargados de config/sources.yaml (vacío si
 	// el archivo no existe: los canales también pueden administrarse por DB)
@@ -62,6 +68,23 @@ type Config struct {
 	// (idempotente vía EnsureActiveJob). Default true;
 	// CLIPFACTORY_DISCOVER_ON_START=false para desactivarlo.
 	DiscoverOnStart bool
+
+	// RetentionInterval: cada cuánto ejecutar la limpieza de videos completados
+	// antiguos. Default: 24h (ver CLIPFACTORY_RETENTION_INTERVAL).
+	RetentionInterval time.Duration
+
+	// RetentionMaxAge: máxima antigüedad de videos 'completed' para conservar.
+	// Default: 720h (30 días, ver CLIPFACTORY_RETENTION_MAX_AGE).
+	RetentionMaxAge time.Duration
+
+	// MinFreeDiskSpace: espacio libre mínimo en bytes en el directorio de datos
+	// antes de encolar nuevos downloads. Default: 1GB (ver CLIPFACTORY_MIN_FREE_DISK_SPACE).
+	// Si el espacio libre es menor, no se encolan nuevos downloads (se reintenta en el siguiente tick).
+	MinFreeDiskSpace int64
+
+	// MetricsAddr: dirección para exponer métricas Prometheus (ej: ":9090").
+	// Vacío = desactivado (default).
+	MetricsAddr string
 
 	// Platform credentials (cargadas desde archivos en credentials/)
 	Twitch  TwitchConfig
@@ -130,6 +153,7 @@ func LoadConfig() (*Config, error) {
 		LogLevel:             getEnv("CLIPFACTORY_LOG_LEVEL", "info"),
 		MaxConcurrentJobs:    getEnvInt("CLIPFACTORY_MAX_CONCURRENT_JOBS", runtime.NumCPU()),
 		PollInterval:         getEnvDuration("CLIPFACTORY_POLL_INTERVAL", "5s"),
+		WorkerID:             getEnv("CLIPFACTORY_WORKER_ID", defaultWorkerID()),
 		TwitchDownloaderPath: getEnv("CLIPFACTORY_TWITCH_DOWNLOADER_PATH", "TwitchDownloaderCLI"),
 		FFmpegPath:           getEnv("CLIPFACTORY_FFMPEG_PATH", "ffmpeg"),
 	}
@@ -138,6 +162,16 @@ func LoadConfig() (*Config, error) {
 
 	// auto-discovery al arrancar el worker ("true"/"1"/"yes"; default true)
 	cfg.DiscoverOnStart = getEnvBool("CLIPFACTORY_DISCOVER_ON_START", true)
+
+	// retención de videos completados
+	cfg.RetentionInterval = getEnvDuration("CLIPFACTORY_RETENTION_INTERVAL", "24h")
+	cfg.RetentionMaxAge = getEnvDuration("CLIPFACTORY_RETENTION_MAX_AGE", "720h")
+
+	// espacio libre mínimo en disco (bytes)
+	cfg.MinFreeDiskSpace = getEnvInt64("CLIPFACTORY_MIN_FREE_DISK_SPACE", 1024*1024*1024) // 1GB default
+
+	// métricas Prometheus
+	cfg.MetricsAddr = getEnv("CLIPFACTORY_METRICS_ADDR", "")
 
 	// 2) sources.yaml (canales a monitorear) — opcional, stub hoy
 	sources, err := loadSources(filepath.Join(cfg.ConfigDir, "sources.yaml"))
@@ -192,109 +226,29 @@ func stripInlineComment(value string) string {
 	return v
 }
 
-// loadSources lee los canales a monitorear desde config/sources.yaml.
-//
-// El archivo usa un SUBCONJUNTO mínimo de YAML, parseado a mano (sin
-// dependencias externas, igual que los .conf). Formato:
-//
-//	sources:
-//	  - platform: twitch
-//	    channel_id: "4919"       # broadcaster ID numérico (Guía de Twitch §6)
-//	    channel_name: illojuan
-//	    active: true
-//	  - platform: kick
-//	    channel_id: "illojuan"   # slug del canal en kick.com
-//	    channel_name: illojuan (kick)
-//	    # active default: true
-//
-// Reglas del parser:
-//   - ignora líneas vacías y comentarios (# de línea completa)
-//   - comentarios INLINE: ` #...` en un valor se corta (fuera de comillas,
-//     ver stripInlineComment); "valor # citado" se preserva
-//   - la lista vive bajo la clave `sources:`; cada ítem empieza con `- `
-//     (puede ser `- key: value` con la primera clave en la misma línea)
-//   - claves reconocidas por ítem: platform, channel_id, channel_name, active
-//   - channel_id se lee SIEMPRE como string (los IDs de Twitch son numéricos,
-//     pero se preservan tal cual; entre comillas o no)
-//   - active acepta true/false (default true)
-//
-// Es estricto a propósito: un sources.yaml con un ítem sin platform/channel_id,
-// una plataforma desconocida o contenido fuera de la lista `sources` es ERROR
-// (el archivo existe = el operador quiso configurar algo: mejor fallar al
-// arrancar que ignorar canales silenciosamente).
+// sourcesYAML define la estructura del archivo sources.yaml para yaml.v3
+type sourcesYAML struct {
+	Sources []SourceConfig `yaml:"sources"`
+}
+
+// loadSources lee los canales a monitorear desde config/sources.yaml usando yaml.v3.
 func loadSources(path string) ([]SourceConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	var sources []SourceConfig
-	var current *SourceConfig
-	inSources := false
+	var sy sourcesYAML
+	if err := yaml.Unmarshal(data, &sy); err != nil {
+		return nil, fmt.Errorf("%s: error parseando YAML: %w", path, err)
+	}
 
-	for lineNum, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// clave de primer nivel: termina/reinicia la lista
-		if !strings.HasPrefix(line, "-") && !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t") {
-			if strings.HasSuffix(line, ":") {
-				inSources = strings.TrimSuffix(line, ":") == "sources"
-				current = nil
-				continue
-			}
-			return nil, fmt.Errorf("%s línea %d: contenido inesperado %q (solo se admite la lista 'sources:')", path, lineNum+1, line)
-		}
-		if !inSources {
-			return nil, fmt.Errorf("%s línea %d: contenido fuera de 'sources:' %q", path, lineNum+1, line)
-		}
-
-		// nuevo ítem de la lista
-		if strings.HasPrefix(line, "-") {
-			rest := strings.TrimSpace(strings.TrimPrefix(line, "-"))
-			sources = append(sources, SourceConfig{Active: true}) // default
-			current = &sources[len(sources)-1]
-			if rest == "" {
-				continue
-			}
-			line = rest // `- key: value` → procesar la clave en la misma línea
-		}
-
-		// clave: valor dentro del ítem actual
-		if current == nil {
-			return nil, fmt.Errorf("%s línea %d: clave %q sin ítem (-) previo", path, lineNum+1, line)
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("%s línea %d: se esperaba 'clave: valor', got %q", path, lineNum+1, line)
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.Trim(stripInlineComment(parts[1]), `"`)
-		switch key {
-		case "platform":
-			current.Platform = value
-		case "channel_id":
-			current.ChannelID = value
-		case "channel_name":
-			current.ChannelName = value
-		case "active":
-			switch strings.ToLower(value) {
-			case "true", "1", "yes", "":
-				current.Active = true
-			case "false", "0", "no":
-				current.Active = false
-			default:
-				return nil, fmt.Errorf("%s línea %d: active inválido %q (usar true/false)", path, lineNum+1, value)
-			}
-		default:
-			return nil, fmt.Errorf("%s línea %d: clave desconocida %q (soportadas: platform, channel_id, channel_name, active)", path, lineNum+1, key)
-		}
+	if len(sy.Sources) == 0 {
+		return nil, fmt.Errorf("%s: la lista 'sources' está vacía", path)
 	}
 
 	// validación por ítem: lo mínimo para que el discovery funcione
-	for i, s := range sources {
+	for i, s := range sy.Sources {
 		if s.Platform == "" || s.ChannelID == "" {
 			return nil, fmt.Errorf("%s: sources[%d] necesita 'platform' y 'channel_id'", path, i)
 		}
@@ -305,10 +259,11 @@ func loadSources(path string) ([]SourceConfig, error) {
 			return nil, fmt.Errorf("%s: sources[%d] plataforma desconocida %q (soportadas: twitch, kick)", path, i, s.Platform)
 		}
 		if s.ChannelName == "" {
-			sources[i].ChannelName = s.ChannelID // nombre legible por defecto
+			sy.Sources[i].ChannelName = s.ChannelID // nombre legible por defecto
 		}
+		// active default true ya se maneja en SourceConfig
 	}
-	return sources, nil
+	return sy.Sources, nil
 }
 
 // loadMetaConfig lee credentials/meta.conf (mismo formato clave=valor que
@@ -455,6 +410,19 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+// defaultWorkerID genera la identidad default del worker: hostname, con
+// fallback a "worker-local" si el SO no lo reporta (contenedores con hostname
+// raro tampoco es problema: cada contenedor tiene el suyo). Si algún día
+// corren N workers en la MISMA máquina, el operador fija CLIPFACTORY_WORKER_ID
+// distinto por proceso.
+func defaultWorkerID() string {
+	h, err := os.Hostname()
+	if err != nil || h == "" {
+		return "worker-local"
+	}
+	return h
+}
+
 // getEnvBool lee una variable de entorno como bool: "true", "1" y "yes" (en
 // cualquier combinación de mayúsculas/minúsculas) son true; "false", "0" y
 // "no" son false; cualquier otra cosa (incluido vacío/no existir) devuelve el
@@ -495,6 +463,17 @@ func getEnvDuration(key string, defaultValue string) time.Duration {
 		return d
 	}
 	return 5 * time.Second
+}
+
+// getEnvInt64 lee una variable de entorno como int64; si falta o no es numérica,
+// devuelve el default.
+func getEnvInt64(key string, defaultValue int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return i
+		}
+	}
+	return defaultValue
 }
 
 // Validate verifica que la configuración sea consistente antes de arrancar el worker.

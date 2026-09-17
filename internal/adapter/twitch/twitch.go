@@ -260,6 +260,14 @@ func (a *TwitchAdapter) fetchClipsPage(ctx context.Context, channelID string, af
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// 429: rate limit de Helix — el worker necesita saber CUÁNDO reintentar.
+		// Helix no envía Retry-After; usamos el default de 60s (basta para que
+		// se restablezca la ventana por-app) y lo deja parametrizable para tests
+		// y por si la API empieza a enviar el header.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), DefaultTwitchRetryAfter)
+			return nil, "", &RateLimitError{RetryAfter: retryAfter}
+		}
 		return nil, "", fmt.Errorf("api returned status %d", resp.StatusCode)
 	}
 

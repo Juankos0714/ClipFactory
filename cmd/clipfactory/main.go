@@ -26,11 +26,16 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/juankos0714/clipfactory/config"
 	"github.com/juankos0714/clipfactory/internal/adapter/ffmpeg"
@@ -54,6 +59,8 @@ Comandos:
   status       Muestra el estado del sistema
   discovery    encola un job de discovery por cada canal activo (el worker
                los procesa: busca clips nuevos y encola sus descargas)
+  doctor       verifica dependencias del sistema (ffmpeg, TwitchDownloaderCLI,
+               credenciales, base de datos)
   help         Muestra este mensaje
 
 Flujo del pipeline:
@@ -75,10 +82,6 @@ clips, jobs y publicaciones para idempotencia y reintentos con backoff.`)
 // imprime la ayuda en stderr y sale con código 1 (útil para scripts que chequean
 // el exit code).
 func main() {
-	// Log de diagnóstico: imprime los argumentos recibidos (útil al depurar
-	// invocaciones desde Docker/scripts donde es fácil perder un flag).
-	fmt.Println("args:", os.Args)
-
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(0)
@@ -93,6 +96,8 @@ func main() {
 		runStatus()
 	case "discovery":
 		runDiscovery()
+	case "doctor":
+		runDoctor()
 	case "help":
 		printUsage()
 	default:
@@ -127,10 +132,15 @@ func runWorker() {
 		os.Exit(1)
 	}
 
-	// Paso 2: armar el WorkerConfig con defaults sensatos para el hardware
-	// objetivo (2 jobs concurrentes: 1 ffmpeg + 1 descarga, poll cada 5s).
+	// Paso 2: armar el WorkerConfig. Los campos operativos vienen TODOS de
+	// config.Config (env vars) — nada hardcoded acá: sin esta propagación las
+	// CLIPFACTORY_MAX_CONCURRENT_JOBS / CLIPFACTORY_POLL_INTERVAL documentadas
+	// no tendrían efecto.
 	wcfg := worker.DefaultWorkerConfig(cfg.DBPath)
 	wcfg.DataDir = cfg.DataDir
+	wcfg.MaxConcurrentJobs = cfg.MaxConcurrentJobs
+	wcfg.PollInterval = cfg.PollInterval
+	wcfg.WorkerID = cfg.WorkerID
 
 	// intervalo del re-encolado automático de publications (default 5m,
 	// CLIPFACTORY_POLL_PUBLICATIONS_INTERVAL para cambiarlo)
@@ -140,6 +150,11 @@ func runWorker() {
 	// para desactivar): el worker encola un job discovery por cada canal activo
 	// en su primer tick, así la primera pasada no requiere el CLI 'discovery'
 	wcfg.DiscoverOnStart = cfg.DiscoverOnStart
+
+	// retención de videos completados
+	wcfg.RetentionInterval = cfg.RetentionInterval
+	wcfg.RetentionMaxAge = cfg.RetentionMaxAge
+	wcfg.MinFreeDiskSpace = cfg.MinFreeDiskSpace
 
 	// --- Adaptadores de ORIGEN (jobs 'discovery' y 'download') ---
 	// Mapas por plataforma: el worker resuelve por source.platform /
@@ -213,6 +228,34 @@ func runWorker() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error creando worker: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Métricas Prometheus (opcional: CLIPFACTORY_METRICS_ADDR para activar)
+	if cfg.MetricsAddr != "" {
+		go func() {
+			http.HandleFunc("/metrics", func(rw http.ResponseWriter, req *http.Request) {
+				if req.Method != http.MethodGet {
+					http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+				// Métricas básicas en formato Prometheus
+				status := w.Status()
+				fmt.Fprintf(rw, "# HELP clipfactory_worker_started Worker started status\n")
+				fmt.Fprintf(rw, "# TYPE clipfactory_worker_started gauge\n")
+				started := "0"
+				if startedVal, ok := status["started"].(bool); ok && startedVal {
+					started = "1"
+				}
+				fmt.Fprintf(rw, "clipfactory_worker_started %s\n", started)
+				fmt.Fprintf(rw, "# HELP clipfactory_worker_max_concurrent_jobs Max concurrent jobs configured\n")
+				fmt.Fprintf(rw, "# TYPE clipfactory_worker_max_concurrent_jobs gauge\n")
+				fmt.Fprintf(rw, "clipfactory_worker_max_concurrent_jobs %d\n", status["max_concurrent"])
+			})
+			log.Printf("[main] métricas Prometheus en %s", cfg.MetricsAddr)
+			if err := http.ListenAndServe(cfg.MetricsAddr, nil); err != nil {
+				log.Printf("[main] metrics server error: %v", err)
+			}
+		}()
 	}
 
 	if err := w.Start(); err != nil {
@@ -470,4 +513,176 @@ func runDiscovery() {
 	}
 
 	fmt.Printf("\nlisto: %d discovery encolados, %d ya en vuelo. Arrancá el worker para procesarlos.\n", enqueued, skipped)
+}
+
+// runDoctor ejecuta el comando 'doctor': verifica las dependencias del sistema.
+func runDoctor() {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error cargando config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("=== ClipFactory Doctor ===")
+	allOK := true
+
+	// 1. ffmpeg
+	fmt.Print("ffmpeg: ")
+	ffmpegPath := cfg.FFmpegPath
+	if ffmpegPath == "" {
+		ffmpegPath = "ffmpeg"
+	}
+	if _, err := exec.LookPath(ffmpegPath); err != nil {
+		fmt.Println("❌ NO ENCONTRADO en PATH")
+		allOK = false
+	} else {
+		// verificar versión
+		cmd := exec.Command(ffmpegPath, "-version")
+		out, _ := cmd.Output()
+		lines := strings.Split(string(out), "\n")
+		if len(lines) > 0 {
+			fmt.Printf("✅ %s\n", strings.TrimSpace(lines[0]))
+		} else {
+			fmt.Println("✅ encontrado")
+		}
+	}
+
+	// 2. TwitchDownloaderCLI (solo si hay canales Twitch)
+	fmt.Print("TwitchDownloaderCLI: ")
+	tdlPath := cfg.TwitchDownloaderPath
+	if tdlPath == "" {
+		tdlPath = "TwitchDownloaderCLI"
+	}
+	if cfg.Twitch.ClientID != "" {
+		if _, err := exec.LookPath(tdlPath); err != nil {
+			fmt.Println("❌ NO ENCONTRADO en PATH (requerido para canales Twitch)")
+			allOK = false
+		} else {
+			cmd := exec.Command(tdlPath, "--version")
+			out, _ := cmd.CombinedOutput() // puede salir != 0
+			lines := strings.Split(string(out), "\n")
+			if len(lines) > 0 && strings.TrimSpace(lines[0]) != "" {
+				fmt.Printf("✅ %s\n", strings.TrimSpace(lines[0]))
+			} else {
+				fmt.Println("✅ encontrado (--version no dio output limpio)")
+			}
+		}
+	} else {
+		fmt.Println("⚠️  no requerido (sin credenciales Twitch)")
+	}
+
+	// 3. Credenciales
+	fmt.Println("Credenciales:")
+	// Twitch
+	if cfg.Twitch.ClientID != "" {
+		fmt.Println("  Twitch: ✅ ClientID presente")
+		if cfg.Twitch.AuthToken != "" {
+			fmt.Println("         ✅ AuthToken presente")
+		} else {
+			fmt.Println("         ⚠️  AuthToken vacío (rate limit bajo)")
+		}
+	} else {
+		fmt.Println("  Twitch: ❌ ClientID vacío")
+		allOK = false
+	}
+
+	// YouTube
+	if cfg.YouTube.ClientID != "" && cfg.YouTube.ClientSecret != "" && cfg.YouTube.RefreshToken != "" {
+		fmt.Println("  YouTube: ✅ completo")
+	} else {
+		fmt.Println("  YouTube: ❌ incompleto (falta ClientID/ClientSecret/RefreshToken)")
+		allOK = false
+	}
+
+	// Meta
+	if cfg.Meta.PageID != "" && cfg.Meta.AccessToken != "" {
+		fmt.Println("  Meta: ✅ completo")
+	} else {
+		fmt.Println("  Meta: ⚠️  incompleto (falta PageID/AccessToken)")
+	}
+
+	// 4. Base de datos
+	fmt.Print("Base de datos: ")
+	if _, err := os.Stat(cfg.DBPath); os.IsNotExist(err) {
+		fmt.Printf("❌ NO EXISTE en %s\n", cfg.DBPath)
+		allOK = false
+	} else {
+		conn, err := db.InitDB(cfg.DBPath)
+		if err != nil {
+			fmt.Printf("❌ error conectando: %v\n", err)
+			allOK = false
+		} else {
+			version, _ := db.SchemaVersion(conn)
+			fmt.Printf("✅ accesible (schema v%d)\n", version)
+			conn.Close()
+		}
+	}
+
+	// 5. Directorio de datos
+	fmt.Print("Directorio de datos: ")
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		fmt.Printf("❌ no accesible: %v\n", err)
+		allOK = false
+	} else {
+		free, err := freeDiskSpace(cfg.DataDir)
+		if err != nil {
+			fmt.Printf("⚠️  no se pudo verificar espacio libre: %v\n", err)
+		} else {
+			fmt.Printf("✅ accesible (libre: %s)\n", humanizeBytes(free))
+		}
+	}
+
+	fmt.Println()
+	if allOK {
+		fmt.Println("✅ Todo OK — el worker puede arrancar")
+		os.Exit(0)
+	} else {
+		fmt.Println("❌ Hay problemas que deben corregirse antes de arrancar el worker")
+		os.Exit(1)
+	}
+}
+
+// freeDiskSpace retorna el espacio libre en bytes (duplicado de worker para doctor).
+func freeDiskSpace(path string) (int64, error) {
+	var free int64
+	if runtime.GOOS == "windows" {
+		kernel32 := syscall.NewLazyDLL("kernel32.dll")
+		getDiskFreeSpaceEx := kernel32.NewProc("GetDiskFreeSpaceExW")
+		pathPtr, err := syscall.UTF16PtrFromString(path)
+		if err != nil {
+			return 0, err
+		}
+		var freeBytesAvailable, totalNumberOfBytes, totalNumberOfFreeBytes int64
+		r1, _, err := getDiskFreeSpaceEx.Call(
+			uintptr(unsafe.Pointer(pathPtr)),
+			uintptr(unsafe.Pointer(&freeBytesAvailable)),
+			uintptr(unsafe.Pointer(&totalNumberOfBytes)),
+			uintptr(unsafe.Pointer(&totalNumberOfFreeBytes)),
+		)
+		if r1 == 0 {
+			return 0, fmt.Errorf("GetDiskFreeSpaceEx failed: %v", err)
+		}
+		free = freeBytesAvailable
+	} else {
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(path, &stat); err != nil {
+			return 0, err
+		}
+		free = int64(stat.Bavail) * int64(stat.Bsize)
+	}
+	return free, nil
+}
+
+// humanizeBytes formatea bytes en formato legible.
+func humanizeBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }

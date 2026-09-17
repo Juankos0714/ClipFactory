@@ -32,12 +32,16 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
+	"github.com/juankos0714/clipfactory/internal/adapter"
 	"github.com/juankos0714/clipfactory/internal/adapter/twitch"
 	"github.com/juankos0714/clipfactory/internal/adapter/youtube"
 	"github.com/juankos0714/clipfactory/internal/db"
@@ -71,6 +75,18 @@ type WorkerConfig struct {
 	// a mano o por otro mecanismo). Default: 5m (ver DefaultWorkerConfig).
 	PollPublicationsInterval time.Duration
 
+	// RetentionInterval cada cuánto ejecutar la limpieza de videos completados
+	// antiguos. 0 = desactivado. Default: 24h (ver DefaultWorkerConfig).
+	RetentionInterval time.Duration
+
+	// RetentionMaxAge máxima antigüedad de videos 'completed' para conservar.
+	// Default: 720h (30 días).
+	RetentionMaxAge time.Duration
+
+	// MinFreeDiskSpace espacio libre mínimo en bytes en DataDir para encolar
+	// nuevos downloads. 0 = desactivado. Default: 1GB.
+	MinFreeDiskSpace int64
+
 	DB                *sql.DB               // nil = el worker abre su propia conexión con InitDB(DBPath)
 	Discoverer        Discoverer            // (legacy) hoy Twitch: queda registrado como discoverer "twitch"
 	Discoverers       map[string]Discoverer // por plataforma: "twitch", "kick" (agrega/sobrescribe al legacy)
@@ -97,6 +113,9 @@ func DefaultWorkerConfig(dbPath string) WorkerConfig {
 		// auto-discovery: la primera pasada no necesita el CLI 'discovery'
 		DiscoverOnStart:          true,
 		PollPublicationsInterval: 5 * time.Minute, // re-encolado automático de publishes
+		RetentionInterval:        24 * time.Hour,
+		RetentionMaxAge:          720 * time.Hour, // 30 días
+		MinFreeDiskSpace:         1024 * 1024 * 1024, // 1GB
 	}
 }
 
@@ -171,6 +190,7 @@ type Worker struct {
 	pollMu           sync.Mutex            // serializa el poll de publications (EnsureActiveJob es check-then-insert)
 	pollLastEnqueued time.Time             // última vez que se encoló (o intentó) el poll_publications
 	discoveryTried   atomic.Bool           // auto-discovery ya intentado (UNA vez por proceso, no por tick)
+	retentionLastRun time.Time             // última vez que se ejecutó la limpieza de retención
 }
 
 // DefaultDataDir es el directorio de datos por defecto (coincide con config.LoadConfig).
@@ -306,6 +326,7 @@ func (w *Worker) loop(ctx context.Context) {
 			w.maybeDiscoverOnStart(ctx)
 			w.processJobs(ctx)
 			w.maybePollPublications(ctx)
+			w.maybeRetentionCleanup(ctx)
 		}
 	}
 }
@@ -530,6 +551,32 @@ func (w *Worker) maybePollPublications(ctx context.Context) {
 	_ = ctx // reservado para cancelación futura
 }
 
+// maybeRetentionCleanup ejecuta la limpieza de videos completados antiguos
+// según el intervalo RetentionInterval (default 24h). 0 = desactivado.
+// Limpia videos con status='completed' más antiguos que RetentionMaxAge (default 30 días).
+func (w *Worker) maybeRetentionCleanup(ctx context.Context) {
+	interval := w.cfg.RetentionInterval
+	if interval <= 0 {
+		return // desactivado por config
+	}
+
+	if !w.retentionLastRun.IsZero() && time.Since(w.retentionLastRun) < interval {
+		return // aún no vence el intervalo
+	}
+
+	w.retentionLastRun = time.Now()
+
+	deleted, err := db.CleanupOldCompletedVideos(w.db, w.cfg.RetentionMaxAge)
+	if err != nil {
+		log.Printf("[worker] retention cleanup error: %v", err)
+		return
+	}
+	if deleted > 0 {
+		log.Printf("[worker] retention cleanup: %d videos antiguos eliminados", deleted)
+	}
+	_ = ctx // reservado para cancelación futura
+}
+
 // pollPublications es el corazón del re-encolado automático de publications.
 //
 // Recorre las publications reintentables de TODAS las plataformas conocidas
@@ -644,6 +691,19 @@ func (w *Worker) executeDiscovery(ctx context.Context, job db.Job) error {
 	// MaxClipsPerDiscovery permite limitar el backlog en canales muy activos)
 	clips, err := discoverer.ListClips(ctx, source.ChannelID, after, 1)
 	if err != nil {
+		// rate limit de Twitch (429): NO es un fallo del canal — re-encolar el
+		// job discovery con created_at futuro (el scheduler no lo ofrece hasta
+		// que venza) y terminar el job 'done'. Sin esto, un 429 durante el
+		// discovery dejaría el canal sin sincronizar hasta reinicio o CLI manual.
+		var tle *twitch.RateLimitError
+		if errors.As(err, &tle) {
+			when := time.Now().UTC().Add(tle.RetryAfter)
+			if enqueued := w.requeueDiscovery(job, source.ID, when); enqueued {
+				log.Printf("[worker] discovery %s/%s rate-limited, reintentando a las %v (%v)",
+					source.Platform, source.ChannelID, when.Format(time.RFC3339), tle.RetryAfter)
+			}
+			return nil // job 'done': el reintento ya quedó programado
+		}
 		return fmt.Errorf("list clips de %s/%s: %w", source.Platform, source.ChannelID, err)
 	}
 	log.Printf("[worker] discovery %s/%s: %d clips recibidos (after=%v)",
@@ -681,6 +741,18 @@ func (w *Worker) executeDiscovery(ctx context.Context, job db.Job) error {
 		}
 
 		if !exists {
+			// check espacio libre en disco antes de encolar download
+			if w.cfg.MinFreeDiskSpace > 0 {
+				free, err := freeDiskSpace(w.cfg.DataDir)
+				if err != nil {
+					log.Printf("[worker] disk space check failed: %v", err)
+				} else if free < w.cfg.MinFreeDiskSpace {
+					log.Printf("[worker] espacio libre insuficiente (%d bytes < %d), saltando encolado de download para %s",
+						free, w.cfg.MinFreeDiskSpace, clip.ID)
+					continue
+				}
+			}
+
 			newClips++
 			downloadJob := &db.Job{
 				Type:          "download",
@@ -1008,6 +1080,38 @@ func (w *Worker) executeThumbnail(ctx context.Context, job db.Job) error {
 //     jobs con created_at <= now, así que el job "duerme" hasta que vence el
 //     backoff/cuota. Complementa al job poll_publications (que re-encola
 //     publications sin job futuro, p.ej. tras un crash del worker).
+// Reconciler es la capacidad opcional de un Publisher de BUSCAR publicaciones
+// ya hechas en la plataforma. La usa executePublish para reconciliar antes de
+// reintentar un upload: con la clave determinista cf-<clip>-<video> en la
+// descripción, si el intento anterior subió el video y murió antes de
+// actualizar la DB, el reintento lo encuentra y NO vuelve a subir (el
+// escenario de duplicados: "YouTube acepta → worker cae → retry sube otra
+// vez").
+//
+// Nil-safe: los publishers que no implementan FindRecentByMarker (fakes de
+// tests, adaptadores mínimos) saltean la reconciliación y van directo al
+// upload — mismo comportamiento que antes de agregarla.
+type Reconciler interface {
+	// FindRecentByMarker busca entre los videos recientes de la cuenta/página
+	// uno cuya descripción contenga alguno de los markers dados. Devuelve
+	// (externalID, externalURL, nil) si lo encontró, ("", "", nil) si no hay
+	// coincidencia, y error ante fallos de la API (transitorios: el caller
+	// decide; acá se tratan como "no encontrado" para no bloquear el publish).
+	FindRecentByMarker(ctx context.Context, markers []string) (string, string, error)
+}
+
+// executePublish publica el clip de una publication 'pending' vía el
+// Publisher de su plataforma. LA POLITICA DE REINTENTOS vive acá:
+//
+//   - éxito                → 'published' (no reintenta)
+//   - RateLimitError       → 'waiting_rate_limit', reintento a ~24h (reset cuota)
+//   - PermanentError       → 'failed' en el PRIMER intento: credenciales/
+//     parámetros/permisos no se arreglan reintentando; requiere intervención
+//     del operador (renovar token, corregir metadata). DEAD-LETTER visible en
+//     'status' (publications failed).
+//   - error transitorio    → 'error' con backoff exponencial 2^attempts (cap
+//     24h) RE-ENCOLADO para reintento automático... hasta MaxPublishAttempts;
+//     alcanzado el techo → 'failed' (sin más reintentos).
 func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 	if job.ReferenceType != "publications" {
 		return fmt.Errorf("job publish con reference_type inesperado: %s", job.ReferenceType)
@@ -1046,10 +1150,37 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 		return fmt.Errorf("clip %d: archivo no encontrado %s: %w", clip.ID, clip.Filepath, statErr)
 	}
 
-	// metadatos del video en YouTube: título del clip original si lo hay
+	// metadatos del video en YouTube: título del clip original si lo hay.
+	// La descripción lleva el MARKER determinista cf-<clip>-<video>: es la
+	// huella que FindRecentByMarker busca antes de reintentar un upload para
+	// no duplicar (ver Reconciler).
+	videoID, err := db.GetVideoIDByClipID(w.db, clip.ID)
+	if err != nil {
+		videoID = 0 // reconciliación degradada, no bloquea el publish
+	}
 	title := fmt.Sprintf("Clip %s", filepath.Base(clip.Filepath))
-	description := "Clip generado con ClipFactory"
 	tags := []string{"shorts", "clips"}
+	description := fmt.Sprintf("Clip generado con ClipFactory\n%s", strings.Join(db.PublicationKeysForClip(clip.ID, videoID), " "))
+
+	// RECONCILIACIÓN anti-duplicados: si la plataforma ya tiene el video con
+	// este marker (upload previo cuyo update de DB falló/crasheó), registrarlo
+	// y NO volver a subir. Solo aplica a publications con intentos previos:
+	// un publish fresco (attempts=0, sin next_retry_at) no puede ser duplicado
+	// y se ahorra la llamada a la API.
+	if rec, ok := publisher.(Reconciler); ok && (pub.Attempts > 0 || pub.NextRetryAt != nil) {
+		externalID, externalURL, ferr := rec.FindRecentByMarker(ctx, db.PublicationKeysForClip(clip.ID, videoID))
+		if ferr != nil {
+			log.Printf("[worker] publication %d: reconciliación no disponible (%v); continúa el upload", pub.ID, ferr)
+		}
+		if externalID != "" {
+			now := time.Now().UTC()
+			if updErr := db.UpdatePublicationStatus(w.db, pub.ID, "published", externalID, externalURL, "", &now, nil, false); updErr != nil {
+				return fmt.Errorf("update publication tras reconciliar (¡video ya subido %s!): %w", externalID, updErr)
+			}
+			log.Printf("[worker] publication %d RECONCILIADA: ya estaba en %s (%s) de un intento previo; no se duplica", pub.ID, externalID, externalURL)
+			return nil
+		}
+	}
 
 	externalID, externalURL, upErr := publisher.UploadVideo(ctx, clip.Filepath, title, description, tags)
 	switch {
@@ -1065,6 +1196,8 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 		return nil
 
 	default:
+		// rate limit → waiting_rate_limit; permanente → failed SIN reintentos;
+		// el resto → backoff con techo (más abajo).
 		var rle *youtube.RateLimitError
 		if errors.As(upErr, &rle) {
 			// cuota agotada: esperar al reset diario (medianoche PT ≈ 08:00 UTC).
@@ -1080,7 +1213,28 @@ func (w *Worker) executePublish(ctx context.Context, job db.Job) error {
 			return nil
 		}
 
-		// error genérico: backoff exponencial 2^attempts, cap 24h
+		// permanente (credenciales inválidas/revocadas, parámetros rechazados,
+		// permisos): reintentar no lo arregla — dead-letter en el PRIMER intento.
+		if adapter.IsPermanent(upErr) {
+			if updErr := db.UpdatePublicationStatus(w.db, pub.ID, "failed", "", "", upErr.Error(), nil, nil, true); updErr != nil {
+				return fmt.Errorf("update publication (failed/permanent): %w", updErr)
+			}
+			log.Printf("[worker] publication %d FALLÓ (permanente, no se reintenta): %v", pub.ID, upErr)
+			return fmt.Errorf("publish clip %d (permanente): %w", clip.ID, upErr)
+		}
+
+		// fallo transitorio: backoff exponencial 2^attempts, cap 24h, con techo
+		// MaxPublishAttempts (al alcanzarlo la publication muere en 'failed':
+		// reintentar para siempre inundaría la cola y los logs).
+		if pub.Attempts+1 >= adapter.MaxPublishAttempts {
+			if updErr := db.UpdatePublicationStatus(w.db, pub.ID, "failed", "", "",
+					fmt.Sprintf("agotados %d intentos; última causa: %s", adapter.MaxPublishAttempts, upErr.Error()), nil, nil, true); updErr != nil {
+				return fmt.Errorf("update publication (failed/max attempts): %w", updErr)
+			}
+			log.Printf("[worker] publication %d FALLÓ DEFINITIVAMENTE tras %d intentos: %v", pub.ID, adapter.MaxPublishAttempts, upErr)
+			return fmt.Errorf("publish clip %d agotó %d intentos: %w", clip.ID, adapter.MaxPublishAttempts, upErr)
+		}
+
 		delay := time.Duration(1<<uint(pub.Attempts)) * time.Hour
 		if delay > 24*time.Hour {
 			delay = 24 * time.Hour
@@ -1122,6 +1276,46 @@ func (w *Worker) requeuePublish(job db.Job, publicationID int64, when time.Time)
 	}
 }
 
+// requeueDiscovery re-encola un job 'discovery' con created_at = when, para
+// reintentar cuando venza el rate limit (mismo mecanismo de created_at futuro
+// que requeuePublish). El chequeo de duplicados EXCLUYE el propio job en
+// ejecución (está 'running' durante el requeue: sin la exclusión se vería a
+// sí mismo como "ya hay uno activo" y nunca re-encolaría).
+func (w *Worker) requeueDiscovery(job db.Job, sourceID int64, when time.Time) bool {
+	w.pollMu.Lock()
+	defer w.pollMu.Unlock()
+
+	// ¿ya hay OTRO discovery en vuelo o programado para este source?
+	var active int
+	err := w.db.QueryRow(
+		`SELECT 1 FROM jobs WHERE type = 'discovery' AND reference_id = ? AND reference_type = 'sources' AND status IN ('queued', 'running') AND id != ? LIMIT 1`,
+		sourceID, job.ID,
+	).Scan(&active)
+	if err == nil {
+		return false // ya hay otro: no duplicar
+	}
+	if err != sql.ErrNoRows {
+		log.Printf("[worker] error verificando discovery activo de source %d: %v (reintento manual: CLI discovery)", sourceID, err)
+		return false
+	}
+
+	// re-encolar directamente con created_at futuro (el scheduler no ofrece el
+	// job hasta que venza)
+	res, err := w.db.Exec(
+		`INSERT INTO jobs (type, reference_id, reference_type, status, created_at, updated_at)
+		 VALUES ('discovery', ?, 'sources', 'queued', ?, ?)`,
+		sourceID, when.UTC().Format(time.RFC3339), db.NowUTC(),
+	)
+	if err != nil {
+		log.Printf("[worker] error re-encolando discovery de source %d: %v (reintento manual: CLI discovery)", sourceID, err)
+		return false
+	}
+	if _, err := res.LastInsertId(); err != nil {
+		log.Printf("[worker] discovery de source %d re-encolado sin id: %v", sourceID, err)
+	}
+	return true
+}
+
 // Stop detiene el worker de forma graceful: cierra stopCh (el loop y los handlers
 // de señal lo detectan), espera con wg.Wait() a que todo termine y deja 'started'
 // en false. Es idempotente: llamarlo dos veces (o sin Start previo) es un no-op,
@@ -1160,4 +1354,38 @@ func (w *Worker) Status() map[string]interface{} {
 		"max_concurrent": w.cfg.MaxConcurrentJobs,
 		"poll_interval":  w.cfg.PollInterval.String(),
 	}
+}
+
+// freeDiskSpace retorna el espacio libre en bytes en el directorio dado.
+// En Windows usa GetDiskFreeSpaceEx, en Unix usa statfs.
+func freeDiskSpace(path string) (int64, error) {
+	var free int64
+	if runtime.GOOS == "windows" {
+		// Windows: usar GetDiskFreeSpaceEx
+		kernel32 := syscall.NewLazyDLL("kernel32.dll")
+		getDiskFreeSpaceEx := kernel32.NewProc("GetDiskFreeSpaceExW")
+		pathPtr, err := syscall.UTF16PtrFromString(path)
+		if err != nil {
+			return 0, err
+		}
+		var freeBytesAvailable, totalNumberOfBytes, totalNumberOfFreeBytes int64
+		r1, _, err := getDiskFreeSpaceEx.Call(
+			uintptr(unsafe.Pointer(pathPtr)),
+			uintptr(unsafe.Pointer(&freeBytesAvailable)),
+			uintptr(unsafe.Pointer(&totalNumberOfBytes)),
+			uintptr(unsafe.Pointer(&totalNumberOfFreeBytes)),
+		)
+		if r1 == 0 {
+			return 0, fmt.Errorf("GetDiskFreeSpaceEx failed: %v", err)
+		}
+		free = freeBytesAvailable
+	} else {
+		// Unix/Linux: usar statfs
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(path, &stat); err != nil {
+			return 0, err
+		}
+		free = int64(stat.Bavail) * int64(stat.Bsize)
+	}
+	return free, nil
 }

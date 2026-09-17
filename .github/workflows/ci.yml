@@ -1,0 +1,68 @@
+# CI: cada push/PR pasa por vet, fmt-check, tests (normales y con race
+# detector) y build. El race detector es acá donde más vale: el worker tiene
+# goroutines, atomic.Bool, WaitGroup y una SQLite compartida — los tests sin
+# -race no detectan carreras de datos.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet + fmt + test + race + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # gofmt -l lista archivos mal formateados; si hay alguno, falla mostrándolos
+      - name: gofmt check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Archivos con formato incorrecto:"
+            echo "$unformatted"
+            echo "Corré 'gofmt -w .' y commiteá."
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+  # Docker build en CADA PR/push: valida que el stage prod compile (el build
+  # de Docker no está cubierto por go build; ya nos mordió una vez — el stage
+  # prod estuvo roto sin que nadie lo ejecutara).
+  docker:
+    name: docker build (stage prod)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build prod image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: prod
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

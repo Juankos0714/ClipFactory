@@ -34,6 +34,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/juankos0714/clipfactory/internal/adapter"
 )
 
 // Endpoints de Google (sobrescribibles para tests con httptest).
@@ -58,6 +60,7 @@ type Publisher struct {
 
 	TokenURL  string // endpoint OAuth (sobrescribible en tests)
 	UploadURL string // endpoint videos.insert (sobrescribible en tests)
+	APIURL    string // endpoint Data API v3: reconciliación channels.list/playlistItems.list (tests)
 
 	HTTPClient *http.Client
 
@@ -77,6 +80,7 @@ func NewPublisher(clientID, clientSecret, refreshToken string) *Publisher {
 		CategoryID:    "20", // Gaming
 		TokenURL:      DefaultTokenURL,
 		UploadURL:     DefaultUploadURL,
+		APIURL:        DefaultAPIURL,
 		HTTPClient:    &http.Client{Timeout: 10 * time.Minute}, // uploads de clips cortos
 	}
 }
@@ -140,7 +144,14 @@ func (p *Publisher) getAccessToken(ctx context.Context) (string, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
-		return "", fmt.Errorf("token endpoint devolvió %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		rawStr := strings.TrimSpace(string(raw))
+		if permErr := adapter.ClassifyTokenError(resp.StatusCode, rawStr); permErr != nil {
+			// invalid_grant / invalid_client: el refresh_token o las credenciales
+			// están muertos — marcar permanent para que el operador los renueve
+			// en vez de quemar 10 reintentos contra el token endpoint.
+			return "", permErr
+		}
+		return "", fmt.Errorf("token endpoint devolvió %d: %s", resp.StatusCode, rawStr)
 	}
 
 	var tr tokenResponse
@@ -187,22 +198,27 @@ type videoInsertResponse struct {
 	} `json:"status"`
 }
 
+// MaxUploadSize es el tamaño máximo permitido para un upload (100MB).
+// Archivos mayores se rechazan antes de intentar el upload para evitar OOM.
+const MaxUploadSize = 100 * 1024 * 1024
+
 // UploadVideo sube videoPath a YouTube con upload resumable y devuelve el
 // videoId externo y su URL pública (https://youtu.be/<id>).
 //
 // title/description/tags van al snippet. La API rechaza títulos >100 chars y
 // descripciones >5000 (se recortan defensivamente acá).
+// El archivo se streamen desde disco (no se carga en memoria).
 func (p *Publisher) UploadVideo(ctx context.Context, videoPath, title, description string, tags []string) (string, string, error) {
 	if err := p.validate(); err != nil {
 		return "", "", err
 	}
 
-	// leer el video a memoria: los clips son <60s a 1080x1920 CRF23 (~5-15MB),
-	// bien por debajo del límite razonable; el streaming con retry por chunks
-	// queda para el backlog (ver docs/guia-youtube.md §8)
-	data, err := os.ReadFile(videoPath)
+	fileInfo, err := os.Stat(videoPath)
 	if err != nil {
-		return "", "", fmt.Errorf("youtube: leer video %s: %w", videoPath, err)
+		return "", "", fmt.Errorf("youtube: stat video %s: %w", videoPath, err)
+	}
+	if fileInfo.Size() > MaxUploadSize {
+		return "", "", adapter.NewPermanentError(fmt.Sprintf("video excede tamaño máximo permitido (%d bytes)", MaxUploadSize))
 	}
 
 	token, err := p.getAccessToken(ctx)
@@ -260,14 +276,20 @@ func (p *Publisher) UploadVideo(ctx context.Context, videoPath, title, descripti
 		return "", "", fmt.Errorf("youtube: init sin header Location (¿proxy intermedio?)")
 	}
 
-	// PASO 2: subir los bytes a la session URL
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPut, sessionURL, bytes.NewReader(data))
+	// PASO 2: subir el archivo vía streaming (no cargar en memoria)
+	file, err := os.Open(videoPath)
+	if err != nil {
+		return "", "", fmt.Errorf("youtube: abrir video %s: %w", videoPath, err)
+	}
+	defer file.Close()
+
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPut, sessionURL, file)
 	if err != nil {
 		return "", "", fmt.Errorf("youtube: create upload request: %w", err)
 	}
-	upReq.Header.Set("Authorization", "Bearer "+token) // la session URL ya está pre-autorizada, pero el header es inofensivo
+	upReq.Header.Set("Authorization", "Bearer "+token)
 	upReq.Header.Set("Content-Type", "video/mp4")
-	upReq.ContentLength = int64(len(data))
+	upReq.ContentLength = fileInfo.Size()
 
 	upResp, err := p.HTTPClient.Do(upReq)
 	if err != nil {
@@ -293,7 +315,10 @@ func (p *Publisher) UploadVideo(ctx context.Context, videoPath, title, descripti
 }
 
 // classifyHTTPError convierte errores HTTP de la API en errores con la señal
-// que el worker necesita: quotaExceeded → waiting_rate_limit (ver executePublish).
+// que el worker necesita: quotaExceeded/rateLimitExceeded → waiting_rate_limit,
+// 401/403 → permanentes (credenciales/permisos: reintentar no los arregla) y el
+// resto (5xx, timeouts, 4xx raros) queda genérico = TRANSITORIO (con techo
+// MaxPublishAttempts en el worker; conservador: no clasificar de más).
 func (p *Publisher) classifyHTTPError(status int, body []byte) error {
 	raw := strings.TrimSpace(string(body))
 	switch {
@@ -301,6 +326,10 @@ func (p *Publisher) classifyHTTPError(status int, body []byte) error {
 		return &RateLimitError{Detail: raw}
 	case status == http.StatusForbidden && strings.Contains(raw, "rateLimitExceeded"):
 		return &RateLimitError{Detail: raw}
+	case status == http.StatusUnauthorized:
+		return adapter.NewPermanentError(fmt.Sprintf("HTTP 401: %s", raw))
+	case status == http.StatusForbidden:
+		return adapter.NewPermanentError(fmt.Sprintf("HTTP 403: %s", raw))
 	default:
 		return fmt.Errorf("youtube: api devolvió %d: %s", status, raw)
 	}

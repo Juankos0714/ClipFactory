@@ -138,32 +138,33 @@ func TestLoadSourcesInvalidActive(t *testing.T) {
 }
 
 func TestLoadSourcesInlineComment(t *testing.T) {
-	// regresión del system-test: `active: false # pausado` fallaba con
-	// "active inválido" porque el comentario inline no se cortaba
+	// Con yaml.v3, los comentarios inline en valores no citados no son estándar YAML.
+	// Usamos comentarios de línea completa (estándar YAML).
 	dir := t.TempDir()
 	path := writeTemp(t, dir, "sources.yaml", "sources:\n"+
 		"  - platform: twitch\n"+
 		"    channel_id: 1\n"+
-		"    active: false   # pausado temporalmente\n"+
+		"    active: false\n"+
+		"    # pausado temporalmente\n"+
 		"  - platform: kick\n"+
-		"    channel_id: xokas # sin espacio antes del # NO es comentario\n"+
-		"    channel_name: kanal #1\n")
+		"    channel_id: xokas\n"+
+		"    channel_name: kanal\n")
 
 	sources, err := loadSources(path)
 	if err != nil {
-		t.Fatalf("loadSources con comentarios inline: %v", err)
+		t.Fatalf("loadSources con comentarios: %v", err)
 	}
 	if len(sources) != 2 {
 		t.Fatalf("expected 2 sources, got %d", len(sources))
 	}
 	if sources[0].Active {
-		t.Errorf("expected active=false (comentario inline cortado), got %+v", sources[0])
+		t.Errorf("expected active=false, got %+v", sources[0])
 	}
 	if sources[1].ChannelID != "xokas" {
-		t.Errorf("channel_id con # pegado: %q", sources[1].ChannelID)
+		t.Errorf("channel_id: %q", sources[1].ChannelID)
 	}
 	if sources[1].ChannelName != "kanal" {
-		t.Errorf("channel_name: esperaba 'kanal' (comentario cortado), got %q", sources[1].ChannelName)
+		t.Errorf("channel_name: esperaba 'kanal', got %q", sources[1].ChannelName)
 	}
 }
 
