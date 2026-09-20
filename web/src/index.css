@@ -11,7 +11,8 @@
 }
 
 :root {
-  color-scheme: light dark;
+  /* UI dark-only: los controles nativos (scrollbars, inputs) siguen el tema. */
+  color-scheme: dark;
 }
 
 /* Focus visible accesible (WCAG AA) */

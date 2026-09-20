@@ -22,3 +22,15 @@ export function useRetryPublication() {
     },
   })
 }
+
+/** Marca dead-letter (`failed`) una publicación aún no publicada (operador decide). */
+export function useCancelPublication() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => publicationsApi.cancel(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['publications'] })
+      void qc.invalidateQueries({ queryKey: ['system', 'overview'] })
+    },
+  })
+}

@@ -1,12 +1,15 @@
 import axios, { type InternalAxiosRequestConfig } from 'axios'
 import { API_BASE_URL, REQUEST_TIMEOUT } from '../config/env'
 import { toDomainError, type DomainError } from './errors'
+import { getToken, notifyUnauthorized } from '../auth/session'
 
 /**
  * apiClient — instancia axios compartida (AGENTS.md §7).
  * - Base URL: VITE_API_URL (prod) o proxy `/api` (dev).
  * - Todos los errores se normalizan a DomainError en el interceptor de respuesta.
- * - NUNCA se inyectan secretos aquí (los VITE_* van al bundle, son públicos).
+ * - Auth aditiva: si hay token de operador (sesión), se manda como Bearer.
+ * - Un 401 (AUTHENTICATION_REQUIRED del server aditivo) se difunde al provider
+ *   para activar login/protected routes. NUNCA se inyectan secretos de VITE_*.
  */
 export const apiClient = axios.create({
   baseURL: API_BASE_URL || '/',
@@ -15,14 +18,18 @@ export const apiClient = axios.create({
 })
 
 apiClient.interceptors.request.use((config: InternalAxiosRequestConfig) => {
-  // Placeholder: aquí se inyectaría el token de sessão del server aditivo cuando
-  // exista autenticación (FASE 6). Hoy el backend es local/trusted → sin header.
+  const token = getToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
   return config
 })
 
 apiClient.interceptors.response.use(
   (response) => response,
-  (error: unknown) => Promise.reject(toDomainError(error)),
+  (error: unknown) => {
+    const domain = toDomainError(error)
+    if (domain.kind === 'unauthorized') notifyUnauthorized()
+    return Promise.reject(domain)
+  },
 )
 
 export type { DomainError }

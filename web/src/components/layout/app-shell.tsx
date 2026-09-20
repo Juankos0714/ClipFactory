@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { NavLink, Outlet, useLocation } from 'react-router-dom'
+import { Suspense, useEffect, useState } from 'react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import {
   BarChart3,
   Clapperboard,
@@ -14,6 +14,7 @@ import {
   X,
 } from 'lucide-react'
 import { useAuth } from '@/providers/AuthProvider'
+import { Button } from '@/components/ui/button'
 
 interface NavItem {
   to: string
@@ -28,10 +29,10 @@ const NAV: NavItem[] = [
   { to: '/clips', label: 'Clips', icon: Clapperboard },
   { to: '/production', label: 'Production', icon: Factory },
   { to: '/production/queue', label: 'Queue', icon: ListOrdered },
-  { to: '/automation', label: 'Automation', icon: Workflow, phase: 'FASE 5' },
-  { to: '/publications', label: 'Publications', icon: Share2, phase: 'FASE 6' },
-  { to: '/analytics', label: 'Analytics', icon: BarChart3, phase: 'FASE 6' },
-  { to: '/settings', label: 'Settings', icon: Settings, phase: 'FASE 7' },
+  { to: '/automation', label: 'Automation', icon: Workflow },
+  { to: '/publications', label: 'Publications', icon: Share2 },
+  { to: '/analytics', label: 'Analytics', icon: BarChart3 },
+  { to: '/settings', label: 'Settings', icon: Settings },
 ]
 
 function NavList({ onNavigate }: { onNavigate?: () => void }) {
@@ -79,6 +80,33 @@ const TITLES: Record<string, string> = {
   '/publications': 'Publications',
   '/analytics': 'Analytics',
   '/settings': 'Settings',
+}
+
+function AuthControl() {
+  const { sessionActive, serverRequiresAuth, logout } = useAuth()
+  const navigate = useNavigate()
+
+  if (!serverRequiresAuth) return null
+  if (sessionActive) {
+    return (
+      <div className="flex items-center gap-2">
+        <span
+          className="hidden text-xs text-neutral-400 md:inline"
+          title="El navegador guarda el token de operador para este server"
+        >
+          Token activo
+        </span>
+        <Button variant="secondary" size="sm" onClick={logout}>
+          Salir
+        </Button>
+      </div>
+    )
+  }
+  return (
+    <Button variant="secondary" size="sm" onClick={() => void navigate('/login')}>
+      Iniciar sesión
+    </Button>
+  )
 }
 
 function ServerPill() {
@@ -172,11 +200,23 @@ export function AppShell() {
             </button>
             <h1 className="text-base font-semibold text-neutral-100">{title}</h1>
           </div>
-          <ServerPill />
+          <div className="flex items-center gap-3">
+            <AuthControl />
+            <ServerPill />
+          </div>
         </header>
 
         <main id="main" className="flex-1 p-4 sm:p-6">
-          <Outlet />
+          <Suspense
+            fallback={
+              <div role="status" aria-live="polite" className="flex min-h-[40vh] items-center justify-center">
+                <span aria-hidden="true" className="h-5 w-5 animate-spin rounded-full border-2 border-current border-t-transparent text-neutral-500" />
+                <span className="sr-only">Cargando…</span>
+              </div>
+            }
+          >
+            <Outlet />
+          </Suspense>
         </main>
       </div>
     </div>

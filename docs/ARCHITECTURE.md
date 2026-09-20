@@ -240,7 +240,7 @@ src/
 | `axios` | HTTP con interceptores (uniforme) |
 | `tailwindcss` | estilado consistente y responsive (no hay tema previo que pisar) |
 | `lucide-react` | iconografía del dashboard |
-| `recharts` | analítica (gráficos) |
+| `recharts` | analítica (gráficos) — ✓ instalada y en uso desde FASE 6 |
 | `zustand` | SOLO si surge estado global de cliente real (UI transversal) |
 | `@tanstack/react-virtual` | listas grandes (10k+ clips) SI el backend no paginara |
 

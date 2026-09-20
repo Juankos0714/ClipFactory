@@ -107,18 +107,34 @@ Solo se habilita "ejecutar" cuando el backend lo soporte. Nunca se finge ejecuci
 
 ### FASE 7 — Auth + Realtime (si el backend lo soporta)
 
-- Login/logout/sesión + protected routes (estructura lista; activación condicional).
-- SSE/WebSocket para progreso de jobs si existe `poll_publications`/SSE en backend.
+- ✅ **Auth implementada (aditiva y opcional)**: sesión de operador por token Bearer
+  (`/login`, `ProtectedRoute`, control en topbar). Activación condicional:
+  el server solo exige token si `CLIPFACTORY_API_TOKEN` está seteado; un 401 del
+  apiClient activa el login. Realtime: **no aplica** — el backend no expone SSE
+  (`/api/events` es 🧭 BACKLOG), se mantiene el polling de 10s.
+- (Original) Login/logout/sesión + protected routes (estructura lista; activación condicional).
+- (Original) SSE/WebSocket para progreso de jobs si existe `poll_publications`/SSE en backend.
 
 ---
 
 ### FASE 8 — Hardening
 
-- Testing (tests por página + flujos E2E Playwright del maestro).
-- Performance: virtualización de lista de clips (10k+), code splitting por ruta,
+- ✅ **Performance**: code splitting por ruta (`React.lazy`) + **lazy de Recharts**
+  (fuera del bundle principal; chunk propio en `/analytics`).
+  Virtualización de clips: **no aplica** — el backend pagina server-side
+  (AGENTS §4.3); decisión documentada en `FRONTEND_BACKEND_CONTRACT.md`.
+- ✅ **Testing**: Vitest + Testing Library (jsdom) cubre StateView (5 estados),
+  Button, Dialog (a11y) y LoginPage. **E2E Playwright queda como backlog/opcional**
+  (requiere navegadores + backend/mock; no instalado).
+- ✅ **Accesibilidad (WCAG AA)**: `:focus-visible` global, skip-link,
+  `prefers-reduced-motion`, **focus-trap + restauración en Dialog**, `color-scheme`
+  dark (UI dark-only). Contraste verificado (brand ≈4.8:1 sobre surface).
+- ✅ **`FRONTEND_BACKEND_CONTRACT.md`** = snapshot implementado vs backlog + checklist.
+- (Original) Testing (tests por página + flujos E2E Playwright del maestro).
+- (Original) Performance: virtualización de lista de clips (10k+), code splitting por ruta,
   lazy de Recharts.
-- Accesibilidad final (WCAG AA), contraste, foco, navegación teclado.
-- `FRONTEND_BACKEND_CONTRACT.md` final = snapshot del contrato implementado vs
+- (Original) Accesibilidad final (WCAG AA), contraste, foco, navegación teclado.
+- (Original) `FRONTEND_BACKEND_CONTRACT.md` final = snapshot del contrato implementado vs
   backlog, con el checklist completo verificado.
 
 ---
