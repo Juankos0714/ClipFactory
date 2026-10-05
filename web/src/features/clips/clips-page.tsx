@@ -49,6 +49,12 @@ export function ClipsPage() {
     setFilters((prev) => ({ ...prev, ...patch }))
   }
 
+  const resetFilters = () => {
+    setPage(1)
+    setSelected(new Set())
+    setFilters({})
+  }
+
   const toggle = (id: number) => {
     setSelected((prev) => {
       const next = new Set(prev)
@@ -74,7 +80,7 @@ export function ClipsPage() {
           value={filters}
           channels={channelOptions}
           onChange={patchFilters}
-          onReset={() => patchFilters({})}
+          onReset={resetFilters}
         />
       </Card>
 

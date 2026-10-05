@@ -74,11 +74,17 @@ de recurso (`errors.ts`) y para BACKLOG.
 - **Code splitting por ruta + lazy de Recharts**: cada página es un chunk propio;
   Recharts queda fuera del bundle principal y se carga solo en `/analytics`
   (ver `web/src/App.tsx`, `React.lazy`).
-- **Testing**: unit/componentes con Vitest + Testing Library (jsdom, por archivo).
-  Los 5 estados UI, Button, Dialog (a11y) y LoginPage cubiertos.
-- **E2E Playwright**: **backlog/opcional** — requiere instalar navegadores y el
-  backend (o el mock) en CI. No se instaló: los flujos críticos están cubiertos
-  por tests de componentes + el contrato backend (`internal/api/api_test.go`).
+- **Testing**: unit/componentes con Vitest + Testing Library (jsdom, por archivo):
+  `apiClient`/resources, StateView (5 estados), Button, Dialog (a11y), LoginPage,
+  los hooks (channels, jobs, clips, publications, system) y las libs de derivación
+  (status/overview/analytics/automation).
+- **E2E Playwright (implementado)**: `web/e2e/` con 10 specs que corren contra
+  `web/dev-mock.ts` (`VITE_MOCK=true`, middleware de Vite) — así los flujos son
+  deterministas y no dependen del server Go ni de credenciales. Cubre auth,
+  automation, channels, clips, dashboard, navegación, production (pipeline +
+  queue-for-process + regenerate-thumbnail), publications, queue y analytics.
+  El mock es stateful y compartido, por eso `workers: 1` y `fullyParallel: false`
+  (`web/playwright.config.ts`).
 - **A11y**: focus-visible global, skip-link, `prefers-reduced-motion`, focus-trap
   + restauración en Dialog, `color-scheme: dark` (UI dark-only).
 
@@ -98,7 +104,8 @@ Comandos ejecutados sobre `web/` en FASE 8:
 [✓] Endpoints REQUIRED del contrato         todos implementados (backend) y consumidos (frontend); BACKLOG bloqueado/no simulado
 [✓] Sin dependencias injustificadas         set fijo de AGENTS §4.4 + Recharts (justificado en ARCHITECTURE.md §5.1)
 [✓] Sin console.log de debug                no hay logging de debug en el bundle
+[✓] E2E de los flujos críticos              web/e2e/ (10 specs) contra el dev-mock; en CI (job `web`)
 ```
 
-Pendiente claramente identificado: E2E con navegador real (Playwright) y métricas de
-views (requieren job de recolección en backend).
+Pendiente claramente identificado: métricas de views/engagement (requieren un job
+de recolección en backend — hoy Analytics deriva solo de la DB y lo declara 🧭 BACKLOG).

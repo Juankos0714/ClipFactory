@@ -1,4 +1,4 @@
-import type { SelectHTMLAttributes } from 'react'
+import { useId, type SelectHTMLAttributes } from 'react'
 
 export interface SelectOption {
   value: string
@@ -11,14 +11,28 @@ export interface SelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
   placeholder?: string
 }
 
+/**
+ * Select con etiqueta asociada por `aria-labelledby` (no `<label>` envolvente):
+ * si el `<select>` queda dentro del `<label>`, el nombre accesible incluiría el
+ * texto de todos los `<option>` ("EstadoTodosEn cola…") y un lector de pantalla
+ * anunciaría la lista de valores en lugar de la etiqueta.
+ */
 export function Select({ label, options, placeholder, id, className, name, ...rest }: SelectProps) {
-  const selectId = id ?? name
+  const autoId = useId()
+  const selectId = id ?? name ?? autoId
+  const labelId = `${selectId}-label`
+
   return (
-    <label className="flex flex-col gap-1" htmlFor={selectId}>
-      {label ? <span className="text-sm font-medium text-neutral-300">{label}</span> : null}
+    <div className="flex flex-col gap-1">
+      {label ? (
+        <span id={labelId} className="text-sm font-medium text-neutral-300">
+          {label}
+        </span>
+      ) : null}
       <select
         id={selectId}
         name={name}
+        aria-labelledby={label ? labelId : undefined}
         className={`w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-neutral-100 focus:border-brand focus:outline-none ${className ?? ''}`}
         {...rest}
       >
@@ -29,6 +43,6 @@ export function Select({ label, options, placeholder, id, className, name, ...re
           </option>
         ))}
       </select>
-    </label>
+    </div>
   )
 }

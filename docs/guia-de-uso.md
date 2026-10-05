@@ -464,6 +464,29 @@ Notas para desarrolladores:
   con fakes (sin ffmpeg): ver [Arquitectura §3.7](arquitectura-y-decisiones.md#37-inyección-de-dependencias-con-interfaces).
 - Tests reales de ffmpeg se saltan solos si ffmpeg no está en PATH.
 
+### Tests del frontend (`web/`)
+
+```powershell
+cd web
+npm ci
+
+npm run typecheck    # tsc -b --noEmit + tsconfig.node + tsconfig.e2e
+npm run lint         # ESLint
+npm run test         # Vitest (unit + componentes, jsdom)
+
+npx playwright install chromium   # una sola vez
+npm run test:e2e     # Playwright headless
+npm run test:e2e:ui  # inspector (para depurar)
+```
+
+- El E2E corre contra **`web/dev-mock.ts`** (el mock del contrato, middleware de
+  Vite con `VITE_MOCK=true`): no necesita el server Go ni credenciales reales.
+- El mock es **stateful y compartido**, por eso los specs corren en serie
+  (`workers: 1`). Si agregás un spec, elegí filas que ninguna otra suite mutee y
+  no asumas un total absoluto de filas.
+- En CI ambos jobs corren siempre: `test` (Go) y `web` (typecheck + lint +
+  Vitest + Playwright) en `.github/workflows/ci.yml`.
+
 **Compilar el binario:**
 
 ```powershell

@@ -346,7 +346,11 @@ const routes: Array<{ method: string; path: RegExp; handler: Handler }> = [
     path: /^\/api\/jobs$/,
     handler: (_seg, query) => {
       const { page, pageSize } = parsePaging(query)
-      const rows = jobs()
+      const type = query.get('type')
+      const status = query.get('status')
+      let rows = jobs()
+      if (type) rows = rows.filter((j) => j.type === type)
+      if (status) rows = rows.filter((j) => j.status === status)
       return { status: 200, body: paginate(rows, page, pageSize) }
     },
   },
@@ -513,6 +517,26 @@ const routes: Array<{ method: string; path: RegExp; handler: Handler }> = [
     },
   },
   {
+    method: 'POST',
+    path: /^\/api\/clips\/(\d+)\/queue-for-process$/,
+    handler: ([id]) => {
+      const clip = db.clips.get(Number(id))
+      if (!clip) return { status: 404, body: errorBody('NOT_FOUND', `clip ${id} not found`) }
+      clip.status = 'processing'
+      return { status: 200, body: jobAction(addJob('process', Number(id))) }
+    },
+  },
+  {
+    method: 'POST',
+    path: /^\/api\/clips\/(\d+)\/regenerate-thumbnail$/,
+    handler: ([id]) => {
+      const clip = db.clips.get(Number(id))
+      if (!clip) return { status: 404, body: errorBody('NOT_FOUND', `clip ${id} not found`) }
+      clip.thumbnail_path = `/thumbnails/rebuilt-${id}.webp`
+      return { status: 200, body: jobAction(addJob('thumbnail', Number(id))) }
+    },
+  },
+  {
     method: 'GET',
     path: /^\/api\/publications$/,
     handler: (_seg, query) => {
@@ -531,6 +555,91 @@ const routes: Array<{ method: string; path: RegExp; handler: Handler }> = [
         }
       })
       return { status: 200, body: paginate(list, page, pageSize) }
+    },
+  },
+  {
+    method: 'GET',
+    path: /^\/api\/publications\/(\d+)$/,
+    handler: ([id]) => {
+      const p = db.publications.find((x) => x.id === Number(id))
+      if (!p) return { status: 404, body: errorBody('NOT_FOUND', `publication ${id} not found`) }
+      const sc = db.sourceClips.find((x) => db.clips.get(x.id)?.id === p.clip_id)
+      const body: PublicationListItem = {
+        ...p,
+        clip: { id: p.clip_id, title: sc?.title ?? '—', platform: sc?.platform ?? 'twitch' },
+      }
+      return { status: 200, body }
+    },
+  },
+  {
+    method: 'POST',
+    path: /^\/api\/publications\/(\d+)\/retry$/,
+    handler: ([id]) => {
+      const p = db.publications.find((x) => x.id === Number(id))
+      if (!p) return { status: 404, body: errorBody('NOT_FOUND', `publication ${id} not found`) }
+      p.status = 'pending'
+      p.attempts += 1
+      p.error_message = null
+      p.next_retry_at = null
+      p.updated_at = now(0)
+      return { status: 200, body: jobAction(addJob('publish', p.clip_id)) }
+    },
+  },
+  {
+    method: 'POST',
+    path: /^\/api\/publications\/(\d+)\/cancel$/,
+    handler: ([id]) => {
+      const p = db.publications.find((x) => x.id === Number(id))
+      if (!p) return { status: 404, body: errorBody('NOT_FOUND', `publication ${id} not found`) }
+      p.status = 'failed'
+      p.error_message = 'cancelado por el operador'
+      p.next_retry_at = null
+      p.updated_at = now(0)
+      return { status: 200, body: p }
+    },
+  },
+  {
+    method: 'GET',
+    path: /^\/api\/jobs\/(\d+)$/,
+    handler: ([id]) => {
+      const job = db.jobs.find((j) => j.id === Number(id))
+      if (!job) return { status: 404, body: errorBody('NOT_FOUND', `job ${id} not found`) }
+      return { status: 200, body: job }
+    },
+  },
+  {
+    method: 'POST',
+    path: /^\/api\/jobs\/(\d+)\/retry$/,
+    handler: ([id]) => {
+      const job = db.jobs.find((j) => j.id === Number(id))
+      if (!job) return { status: 404, body: errorBody('NOT_FOUND', `job ${id} not found`) }
+      if (job.status !== 'error') {
+        return { status: 409, body: errorBody('CONFLICT', `solo se re-encolan jobs en error (estado ${job.status})`) }
+      }
+      job.status = 'queued'
+      job.attempts += 1
+      job.error_message = null
+      job.locked_at = null
+      job.locked_by = null
+      job.updated_at = now(0)
+      return { status: 200, body: jobAction(job) }
+    },
+  },
+  {
+    method: 'POST',
+    path: /^\/api\/jobs\/(\d+)\/cancel$/,
+    handler: ([id]) => {
+      const job = db.jobs.find((j) => j.id === Number(id))
+      if (!job) return { status: 404, body: errorBody('NOT_FOUND', `job ${id} not found`) }
+      if (job.status !== 'queued' && job.status !== 'running') {
+        return { status: 409, body: errorBody('CONFLICT', `el job ya está en estado ${job.status}`) }
+      }
+      job.status = 'error'
+      job.error_message = 'cancelado por el operador'
+      job.locked_at = null
+      job.locked_by = null
+      job.updated_at = now(0)
+      return { status: 200, body: job }
     },
   },
 ]

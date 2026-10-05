@@ -139,6 +139,16 @@ export function AppShell() {
     setDrawerOpen(false)
   }, [location.pathname])
 
+  // El drawer móvil es un diálogo modal: Escape lo cierra (WCAG 2.1).
+  useEffect(() => {
+    if (!drawerOpen) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setDrawerOpen(false)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [drawerOpen])
+
   const title = TITLES[location.pathname] ?? 'ClipFactory'
 
   return (

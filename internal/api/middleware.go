@@ -65,10 +65,12 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// originAllowed: acceso desde el mismo origen o desde un origin de la allowlist.
+// originAllowed: acceso desde el mismo origen o desde un origin de la allowlist
+// (CLIPFACTORY_CORS_ORIGINS). Los deployments de Vercel se permiten declarando su
+// origin explícitamente: un Origin nunca trae comodines, así que no hay wildcard.
 // No es una frontera de seguridad; el token sigue siendo obligatorio.
 func (s *Server) originAllowed(origin string) bool {
-	if strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "https://*.vercel.app") {
+	if strings.HasPrefix(origin, "http://localhost") {
 		return true
 	}
 	for _, o := range s.cfg.CORSOrigins {

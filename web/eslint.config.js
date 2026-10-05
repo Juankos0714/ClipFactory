@@ -23,7 +23,7 @@ export default tseslint.config(
       ecmaVersion: 2022,
       globals: globals.browser,
       parserOptions: {
-        project: ['./tsconfig.json', './tsconfig.node.json'],
+        project: ['./tsconfig.json', './tsconfig.node.json', './tsconfig.e2e.json'],
         tsconfigRootDir,
       },
     },
@@ -43,6 +43,14 @@ export default tseslint.config(
     files: ['vite.config.ts'],
     languageOptions: {
       globals: globals.node,
+    },
+  },
+  {
+    // `expect(spy.method).toHaveBeenCalledWith(...)` es idiomático en tests: la
+    // regla unbound-method no aporta nada ahí (siempre se verifica un mock).
+    files: ['**/*.test.ts', '**/*.test.tsx', 'e2e/**/*.ts'],
+    rules: {
+      '@typescript-eslint/unbound-method': 'off',
     },
   },
 )

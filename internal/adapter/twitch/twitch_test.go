@@ -198,11 +198,7 @@ func TestDownloadClipMissingBinary(t *testing.T) {
 func TestDownloadClipSuccess(t *testing.T) {
 	// fake de TwitchDownloaderCLI: escribe un archivo donde se le pida y sale 0
 	dir := t.TempDir()
-	fake := filepath.Join(dir, "fake-downloader")
-	script := "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=\"$2\"; shift 2;; *) shift;; esac; done\nprintf 'FAKE_VIDEO_CONTENT' > \"$out\"\n"
-	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake downloader: %v", err)
-	}
+	fake := fakeDownloaderOK(t, dir)
 
 	a := NewTwitchAdapter("my-client-id", "")
 	a.SetDownloaderPath(fake)
@@ -229,11 +225,7 @@ func TestDownloadClipSuccess(t *testing.T) {
 func TestDownloadClipFailingBinary(t *testing.T) {
 	// fake que falla y escribe a stderr (como el CLI real con un clip inexistente)
 	dir := t.TempDir()
-	fake := filepath.Join(dir, "fake-downloader-fail")
-	script := "#!/bin/sh\necho 'FATAL: clip not found' >&2\nexit 1\n"
-	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake failing downloader: %v", err)
-	}
+	fake := fakeDownloaderFailing(t, dir)
 
 	a := NewTwitchAdapter("my-client-id", "")
 	a.SetDownloaderPath(fake)
@@ -257,11 +249,7 @@ func TestDownloadClipFailingBinary(t *testing.T) {
 func TestDownloadClipEmptyOutput(t *testing.T) {
 	// fake que sale 0 pero crea un archivo VACÍO en el destino -o: debe detectarse
 	dir := t.TempDir()
-	fake := filepath.Join(dir, "fake-downloader-empty")
-	script := "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=\"$2\"; shift 2;; *) shift;; esac; done\n: > \"$out\"\n"
-	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake empty downloader: %v", err)
-	}
+	fake := fakeDownloaderEmpty(t, dir)
 
 	a := NewTwitchAdapter("my-client-id", "")
 	a.SetDownloaderPath(fake)
@@ -278,11 +266,7 @@ func TestDownloadClipEmptyOutput(t *testing.T) {
 func TestDownloadClipContextCancelled(t *testing.T) {
 	// fake que tarda 5s: con el contexto cancelado, el exec debe abortar antes
 	dir := t.TempDir()
-	fake := filepath.Join(dir, "fake-downloader-slow")
-	script := "#!/bin/sh\nsleep 5\nprintf 'late' > \"$5\"\n"
-	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake slow downloader: %v", err)
-	}
+	fake := fakeDownloaderSlow(t, dir)
 
 	a := NewTwitchAdapter("my-client-id", "")
 	a.SetDownloaderPath(fake)

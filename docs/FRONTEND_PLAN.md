@@ -124,8 +124,14 @@ Solo se habilita "ejecutar" cuando el backend lo soporte. Nunca se finge ejecuci
   Virtualización de clips: **no aplica** — el backend pagina server-side
   (AGENTS §4.3); decisión documentada en `FRONTEND_BACKEND_CONTRACT.md`.
 - ✅ **Testing**: Vitest + Testing Library (jsdom) cubre StateView (5 estados),
-  Button, Dialog (a11y) y LoginPage. **E2E Playwright queda como backlog/opcional**
-  (requiere navegadores + backend/mock; no instalado).
+  Button, Dialog (a11y), LoginPage, `apiClient`/resources, hooks
+  (channels, jobs, clips, publications, system) y las libs de derivación
+  (status/overview/analytics/automation).
+  **E2E Playwright instalado y en verde** (`web/e2e/`, 10 specs): auth,
+  automation, channels, clips, dashboard, navegación, production (pipeline +
+  acciones), publications, queue y analytics. Corre contra `web/dev-mock.ts`
+  (`VITE_MOCK=true`), en serie porque el mock es stateful compartido.
+  Comandos: `npm run test`, `npm run test:e2e` (o `:ui` / `:headed`).
 - ✅ **Accesibilidad (WCAG AA)**: `:focus-visible` global, skip-link,
   `prefers-reduced-motion`, **focus-trap + restauración en Dialog**, `color-scheme`
   dark (UI dark-only). Contraste verificado (brand ≈4.8:1 sobre surface).

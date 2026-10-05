@@ -76,7 +76,15 @@ export function AnalyticsPage() {
         </p>
       </div>
 
-      <StateView isLoading={isLoading} error={error} loadingRows={4}>
+      <StateView
+        isLoading={isLoading}
+        error={error}
+        onRetry={() => {
+          void overview.refetch()
+          void pubs.refetch()
+        }}
+        loadingRows={4}
+      >
         <div className="grid gap-4 xl:grid-cols-2">
           <Card>
             <CardHeader id="publications-chart" title="Publicaciones por plataforma y estado" />

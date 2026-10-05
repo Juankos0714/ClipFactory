@@ -1,4 +1,4 @@
-import { defineConfig as defineVitestConfig } from 'vitest/config'
+import { defineConfig as defineVitestConfig, configDefaults } from 'vitest/config'
 import { fileURLToPath, URL } from 'node:url'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
@@ -33,6 +33,8 @@ export default defineVitestConfig(({ mode }) => {
     test: {
       environment: 'node',
       setupFiles: ['./src/test/setup.ts'],
+      // `e2e/` es de Playwright (npm run test:e2e), no de Vitest.
+      exclude: [...configDefaults.exclude, 'e2e/**'],
       coverage: {
         provider: 'v8',
         include: ['src/lib/**', 'src/services/**'],

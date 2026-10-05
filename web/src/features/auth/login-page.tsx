@@ -32,7 +32,9 @@ export function LoginPage() {
     formState: { errors },
   } = useForm<LoginValues>({ resolver: zodResolver(loginSchema), defaultValues: { token: '' } })
 
-  if (sessionActive) return <Navigate to="/" replace />
+  // Tras autenticar vuelve a la ruta de origen; si el provider ya marcó la sesión
+  // activa, este guard reemplaza la navegación del submit con el mismo destino.
+  if (sessionActive) return <Navigate to={from ?? '/'} replace />
 
   const onSubmit = (values: LoginValues) => {
     login(values.token)
