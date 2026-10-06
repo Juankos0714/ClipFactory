@@ -27,7 +27,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.25.13"
           cache: true
 
       - name: Run gosec
@@ -48,7 +48,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.25.13"
           cache: true
 
       # govulncheck SÍ falla el job: un CVE alcanzable en dependencias es

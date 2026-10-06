@@ -252,7 +252,7 @@ type createSourceInput struct {
 
 func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 	var input createSourceInput
-	if err := s.decodeJSON(r, &input); err != nil {
+	if err := s.decodeJSON(w, r, &input); err != nil {
 		s.writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "cuerpo JSON inválido")
 		return
 	}
@@ -324,7 +324,7 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
 		ChannelID   *string `json:"channel_id"`
 		Active      *bool   `json:"active"`
 	}
-	if err := s.decodeJSON(r, &input); err != nil {
+	if err := s.decodeJSON(w, r, &input); err != nil {
 		s.writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "cuerpo JSON inválido")
 		return
 	}
@@ -888,7 +888,7 @@ func (s *Server) handleCreatePublication(w http.ResponseWriter, r *http.Request)
 		ClipID   int64  `json:"clip_id"`
 		Platform string `json:"platform"`
 	}
-	if err := s.decodeJSON(r, &input); err != nil {
+	if err := s.decodeJSON(w, r, &input); err != nil {
 		s.writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "cuerpo JSON inválido")
 		return
 	}

@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -69,8 +70,14 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 // (CLIPFACTORY_CORS_ORIGINS). Los deployments de Vercel se permiten declarando su
 // origin explícitamente: un Origin nunca trae comodines, así que no hay wildcard.
 // No es una frontera de seguridad; el token sigue siendo obligatorio.
+//
+// El atajo de desarrollo compara el HOST PARSEADO, nunca un prefijo: comparar
+// strings.HasPrefix("http://localhost") también aceptaría dominios del atacante
+// como "http://localhost.attacker.example" o "http://localhost@attacker.example",
+// que el navegador resuelve como host ajeno. Solo se acepta loopback (localhost,
+// 127.0.0.1, ::1) sobre http, con cualquier puerto de desarrollo.
 func (s *Server) originAllowed(origin string) bool {
-	if strings.HasPrefix(origin, "http://localhost") {
+	if isLoopbackOrigin(origin) {
 		return true
 	}
 	for _, o := range s.cfg.CORSOrigins {
@@ -79,6 +86,18 @@ func (s *Server) originAllowed(origin string) bool {
 		}
 	}
 	return false
+}
+
+// isLoopbackOrigin informa si origin es un origin http://127.0.0.1[:puerto],
+// http://localhost[:puerto] o http://[::1][:puerto]. Cualquier otro esquema,
+// host o path no es loopback.
+func isLoopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "http" || u.Path != "" || u.User != nil {
+		return false
+	}
+	host := u.Hostname() // ya sin el puerto; maneja las IPs entre corchetes
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // -------------------------------------------------- Middleware: auth (Bearer)

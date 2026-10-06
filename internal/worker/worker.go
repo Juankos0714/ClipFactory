@@ -32,6 +32,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -201,6 +202,24 @@ const (
 	ffmpegWidth  = 1080
 	ffmpegHeight = 1920
 )
+
+var clipIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// safeClipFilename valida un identificador de clip de plataforma (twitch/kick)
+// antes de usarlo como nombre de archivo bajo DataDir, y devuelve el nombre.
+//
+// Motivo: el ID viene de la respuesta JSON de la API de la plataforma, sin
+// validar. filepath.Join NORMALIZA, y normalizar ayuda al atacante: un
+// "../../../evil" se convierte en una ruta limpia que escapa de DataDir.
+// filepath.Base por sí solo no alcanza (colapsa el traversal en un nombre
+// inocuo pero pierde la trazabilidad del ID real), así que la validación es
+// explícita y ocurre antes de construir cualquier ruta.
+func safeClipFilename(platformClipID string) (string, error) {
+	if !clipIDPattern.MatchString(platformClipID) {
+		return "", fmt.Errorf("platform_clip_id inválido %q: solo se admiten [A-Za-z0-9_-] (máx 64)", platformClipID)
+	}
+	return platformClipID + ".mp4", nil
+}
 
 // NewWorker crea un nuevo worker.
 func NewWorker(cfg WorkerConfig) (*Worker, error) {
@@ -816,8 +835,14 @@ func (w *Worker) executeDownload(ctx context.Context, job db.Job) error {
 		dataDir = DefaultDataDir
 	}
 	// nombre de archivo determinista: el UNIQUE(filepath) de videos hace que un
-	// reintento con el mismo clip choque aquí en vez de duplicar archivos
-	destPath := filepath.Join(dataDir, "incoming", sc.PlatformClipID+".mp4")
+	// reintento con el mismo clip choque aquA- en vez de duplicar archivos.
+	// El ID se valida antes de tocar filepath: sin esto un ID hostil de la API de
+	// la plataforma escaparía de DataDir al escribir (el Join normaliza el "..").
+	filename, err := safeClipFilename(sc.PlatformClipID)
+	if err != nil {
+		return err
+	}
+	destPath := filepath.Join(dataDir, "incoming", filename)
 
 	// ¿existe ya un video de un intento anterior? (job reintentado tras insert)
 	existing, err := db.GetVideoByFilepath(w.db, destPath)

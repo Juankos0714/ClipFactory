@@ -8,7 +8,7 @@
 # -----------------------------------------------
 # Stage: deps — descarga dependencias de Go
 # -----------------------------------------------
-FROM golang:1.24-bookworm AS deps
+FROM golang:1.25.13-bookworm AS deps
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ RUN go mod download
 # -----------------------------------------------
 # Stage: dev — entorno de desarrollo con herramientas
 # -----------------------------------------------
-FROM golang:1.24-bookworm AS dev
+FROM golang:1.25.13-bookworm AS dev
 
 # instalar herramientas auxiliares para testing del pipeline
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -88,7 +88,7 @@ CMD ["--help"]
 # -----------------------------------------------
 # Stage: prod — binario final minimal
 # -----------------------------------------------
-FROM golang:1.24-bookworm AS prod
+FROM golang:1.25.13-bookworm AS prod
 
 # instalar solo las herramientas necesarias para ejecutar (ffmpeg, sqlite3 para debugging)
 RUN apt-get update && apt-get install -y --no-install-recommends \

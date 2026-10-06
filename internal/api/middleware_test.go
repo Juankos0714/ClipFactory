@@ -24,7 +24,9 @@ func TestCORSAllowedOrigins(t *testing.T) {
 		origin  string
 		allowed bool
 	}{
-		{"http://localhost:5173", true},                       // desarrollo: siempre
+		{"http://localhost:5173", true},                       // loopback: cualquier puerto de dev
+		{"http://localhost:3000", true},                       // loopback, otro puerto
+		{"http://127.0.0.1:5173", true},                       // loopback por IP
 		{"https://clipfactory-abc.vercel.app", true},          // allowlist explícita
 		{"https://otro-vercel-preview-xyz.vercel.app", false}, // no está en la allowlist
 		{"https://evil.example.com", false},
@@ -89,6 +91,33 @@ func TestCORSPreflightOriginNoPermitido(t *testing.T) {
 
 	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Errorf("origin no permitido recibió Access-Control-Allow-Origin = %q", got)
+	}
+}
+
+// Regresión del CORS por prefijo: comparar strings.HasPrefix("http://localhost")
+// aceptaba dominios del atacante que arrancan con ese literal. Todos estos deben
+// quedar FUERA: son cross-origin de verdad pese a "emparejar" por prefijo.
+func TestCORSRechazaDominiosQueEmpiezanPorLocalhost(t *testing.T) {
+	srv := setupServer(t, nil)
+
+	ataque := []string{
+		"http://localhost.attacker.example", // subdominio real del atacante
+		"http://localhost.evil.com",
+		"http://localhostALLOWED",            // sin punto ni puerto
+		"http://localhost@attacker.example",  // userinfo: el host real es attacker.example
+		"https://localhost.attacker.example", // https tampoco es el atajo de dev
+		"null",                               // origin opaco (sandbox / data:), nunca loopback
+	}
+
+	for _, origin := range ataque {
+		req := httptest.NewRequest(http.MethodGet, "/api/sources", nil)
+		req.Header.Set("Origin", origin)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+
+		if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("origin hostil %s recibió Access-Control-Allow-Origin = %q (debe fallar cerrado)", origin, got)
+		}
 	}
 }
 

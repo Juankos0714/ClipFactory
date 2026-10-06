@@ -465,3 +465,78 @@ func (m *mkdirDownloader) DownloadClip(ctx context.Context, clipID string, destP
 	}
 	return m.inner.DownloadClip(ctx, clipID, destPath)
 }
+
+// ------------------------------------------- validacion del platform_clip_id
+
+// El platform_clip_id viene del JSON de Twitch/Kick sin validar. Si se usara
+// crudo como nombre de archivo, filepath.Join NORMALIZA y un ".." escaparia de
+// DataDir al ESCRIBIR. Se verifica que el ID se rechaza ANTES de tocar disco.
+func TestExecuteDownloadRechazaClipIDConTraversal(t *testing.T) {
+	hostiles := []string{
+		"../../../../opt/evil",
+		`..\..\..\..\opt\evil`,
+		"..",
+		".",
+		"clip/../../evil",
+		"",
+		"clip con espacios",
+		"clip;rm -rf /",
+		"clip\x00null",
+		strings.Repeat("a", 65), // supera el max de 64
+	}
+
+	for _, hostile := range hostiles {
+		t.Run(hostile, func(t *testing.T) {
+			conn := openTestDB(t)
+			dataDir := t.TempDir()
+			dl := &fakeDownloader{writeFile: true}
+			w, err := NewWorker(WorkerConfig{
+				DB: conn, Downloader: dl, DataDir: dataDir,
+				WorkerID: "dl-worker", MaxConcurrentJobs: 1,
+				PollInterval: 50 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatalf("create worker: %v", err)
+			}
+			sc := &db.SourceClip{Platform: "twitch", PlatformClipID: hostile, Status: "detected"}
+			if err := db.UpsertSourceClip(conn, sc); err != nil {
+				t.Fatalf("upsert source clip: %v", err)
+			}
+			job := &db.Job{Type: "download", ReferenceID: sc.ID, ReferenceType: "source_clips"}
+			if err := db.EnqueueJob(conn, job); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			if err := db.LockJob(conn, job.ID, w.cfg.WorkerID); err != nil {
+				t.Fatalf("lock: %v", err)
+			}
+
+			if err := w.executeDownload(context.Background(), *job); err == nil {
+				t.Fatalf("executeDownload debió fallar con clip_id hostil %q", hostile)
+			}
+			// el downloader NO debe haberse invocado: el rechazo es previo
+			if len(dl.downloads) != 0 {
+				t.Errorf("el downloader no debía invocarse, se llamó con %v", dl.downloads)
+			}
+			// nada escrito fuera de DataDir
+			outside := filepath.Join(dataDir, "..", "evil.mp4")
+			if _, err := os.Stat(outside); err == nil {
+				t.Errorf("se escribió fuera de DataDir: %s", outside)
+			}
+		})
+	}
+}
+
+// Un ID legítimo con los caracteres que usan Twitch (alfanuméricos + guion) y
+// Kick (guion bajo) debe pasar sin cambios.
+func TestSafeClipFilenameAceptaIDsLegitimos(t *testing.T) {
+	for _, ok := range []string{"1234567890", "Clip-abc_DEF", "a", strings.Repeat("z", 64)} {
+		got, err := safeClipFilename(ok)
+		if err != nil {
+			t.Errorf("safeClipFilename(%q) falló: %v", ok, err)
+			continue
+		}
+		if want := ok + ".mp4"; got != want {
+			t.Errorf("safeClipFilename(%q) = %q, want %q", ok, got, want)
+		}
+	}
+}

@@ -657,3 +657,44 @@ func TestBacklogEndpointsNotFound(t *testing.T) {
 		}
 	}
 }
+
+// ------------------------------------------------------------ limite de body
+
+// Un body JSON por encima de maxBodyBytes debe rechazarse con 400, noOOMear el
+// proceso. Antes no habia cota: json.Decoder leia el body entero a memoria.
+func TestBodyJSONSuperandoElLimiteSeRechaza(t *testing.T) {
+	srv := setupServer(t, nil)
+
+	// un campo de 2 MiB: 4x el limite, en un endpoint que SI lee body
+	enorme := map[string]interface{}{
+		"platform":     "twitch",
+		"channel_id":   strings.Repeat("a", 2<<20),
+		"channel_name": "x",
+	}
+	rr := do(t, srv, http.MethodPost, "/api/sources", enorme, "")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (body de %d bytes)", rr.Code, 2<<20)
+	}
+	var env errorEnvelope
+	decodeBody(t, rr, &env)
+	if env.Error.Code != "VALIDATION_ERROR" {
+		t.Errorf("code = %q, want VALIDATION_ERROR", env.Error.Code)
+	}
+}
+
+// El limite no debe molestar a los bodies normales: un DTO de <1 KiB sigue
+// pasando la decodificacion entera.
+func TestBodyJSONNormalSeAcepta(t *testing.T) {
+	srv := setupServer(t, nil)
+
+	rr := do(t, srv, http.MethodPost, "/api/sources", map[string]interface{}{
+		"platform":     "twitch",
+		"channel_id":   "12345",
+		"channel_name": "canal normal",
+	}, "")
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201 (body: %s)", rr.Code, rr.Body.String())
+	}
+}

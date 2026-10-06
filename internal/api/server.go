@@ -65,6 +65,15 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 		Addr:              addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// ReadTimeout acota también la lectura del body (no solo los headers), así
+		// que un cliente lento no retiene una goroutine indefinidamente.
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout NO se fija a propósito: /api/clips/{id}/video sirve el .mp4
+		// con http.ServeContent y un timeout de escritura cortaría clips largos.
+		// La protección contra body lento la da ReadTimeout; el timeout de escritura
+		// se aplica por handler cuando haga falta (context del worker).
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 	log.Printf("[api] escuchando en %s", addr)
 
@@ -108,10 +117,16 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	}
 }
 
-// decodeJSON decodifica un body JSON; devuelve error de validación si no es JSON.
-func (s *Server) decodeJSON(r *http.Request, dst interface{}) error {
+// maxBodyBytes cota los cuerpos JSON. Los bodies de la API son DTOs pequeños
+// (ids, nombres, flags); 1 MiB es holgado para todos y evita que un cliente
+// pida memoria ilimitada mientras se decodifica un slice o un map.
+const maxBodyBytes = 1 << 20
+
+// decodeJSON decodifica un body JSON; devuelve error de validación si no es JSON
+// o si excede maxBodyBytes.
+func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, dst interface{}) error {
 	defer r.Body.Close()
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}

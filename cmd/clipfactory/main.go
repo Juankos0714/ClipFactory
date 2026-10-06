@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -329,6 +330,7 @@ func runServer() {
 		fmt.Println("CLIPFACTORY_API_ADDR vacío: el comando 'server' no arranca. Configurala, ej. CLIPFACTORY_API_ADDR=:8080")
 		os.Exit(0)
 	}
+	warnInsecureAPI(cfg)
 
 	conn, err := db.InitDB(cfg.DBPath)
 	if err != nil {
@@ -346,6 +348,46 @@ func runServer() {
 		os.Exit(1)
 	}
 	fmt.Println("[main] server apagado")
+}
+
+// warnInsecureAPI avisa en stderr cuando la API arranca SIN autenticación y
+// además queda alcanzable desde la red.
+//
+// El auth es opcional por diseño (docs/API_CONTRACT.md §Auth: token vacío =
+// desarrollo), pero la combinación "token vacío + bind no-loopback" deja los 33
+// endpoints —incluidos DELETE /api/sources/{id} y los bytes de /api/clips/{id}/video—
+// abiertos a cualquier host de la LAN, sin TLS. Es un residuo consciente, no un
+// bug, así que no se bloquea el arranque: se informa con la instrucción exacta.
+func warnInsecureAPI(cfg *config.Config) {
+	if cfg.APIToken != "" || isLoopbackAddr(cfg.APIAddr) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, `
+
+  *** AVISO DE SEGURIDAD: la API arranca SIN autenticación en %s ***
+
+  CLIPFACTORY_API_TOKEN está vacío, así que TODOS los endpoints quedan abiertos:
+  se puede leer la DB completa, descargar los .mp4 y BORRAR canales.
+
+  Opciones (cualquiera lo cierra):
+    1. Exponer solo en loopback:   CLIPFACTORY_API_ADDR=127.0.0.1:%s
+    2. Poner token:                CLIPFACTORY_API_TOKEN=<secreto>   (el frontend lo pide en login)
+    3. Ambos, detrás de un reverse proxy con TLS.
+
+`, cfg.APIAddr, api.DefaultAddr)
+}
+
+// isLoopbackAddr indica si addr escucha solo en la interfaz de loopback.
+// ":8080" y "0.0.0.0:8080" NO lo hacen (Go interpreta el host vacío como todas
+// las interfaces); "127.0.0.1:8080", "[::1]:8080" y "localhost:8080" sí.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// sin puerto o addr raro: no se puede confirmar loopback, se trata como expuesta
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // syncSources aplica config/sources.yaml a la tabla sources de la DB.
