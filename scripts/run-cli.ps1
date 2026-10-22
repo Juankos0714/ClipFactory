@@ -2,11 +2,12 @@ param(
     [string[]]$CliArgs = @()
 )
 
-$ProjectPath = "C:\Users\jucar\OneDrive\Documentos\SoftwareDevelopment\ClipFactory"
+$ProjectPath = Split-Path -Parent $PSScriptRoot
 
 # ruta del binario dentro del contenedor (ahora en /opt/clipfactory/bin/clipfactory)
 $UnixBinaryPath = "/opt/clipfactory/bin/clipfactory"
 
+Write-Output "Project path: $ProjectPath"
 Write-Output "ejecutando ClipFactory con argumentos: $($CliArgs -join ' ')"
 
 # usar docker compose run para ejecutar el binario dentro del contenedor de desarrollo

@@ -15,12 +15,7 @@
 # Copiar a config/sources.yaml (o el directorio de CLIPFACTORY_CONFIG_DIR).
 
 sources:
-  - platform: twitch
-    channel_id: "4919"
-    channel_name: illojuan
-    active: true
-
   - platform: kick
     channel_id: xokas
     channel_name: xokas (kick)
-    # active default: true
+    active: true
