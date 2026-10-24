@@ -240,6 +240,7 @@ func (a *KickAdapter) DownloadClip(ctx context.Context, clipID string, destPath 
 		"-i", detail.VideoURL,
 		"-c", "copy",
 		"-movflags", "+faststart",
+		"-f", "mp4", // formato de salida explícito (necesario por la extensión .part)
 		"-y",
 		tmpPath,
 	)
