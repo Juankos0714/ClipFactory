@@ -240,9 +240,11 @@ func (a *KickAdapter) DownloadClip(ctx context.Context, clipID string, destPath 
 		"-i", detail.VideoURL,
 		"-c", "copy",
 		"-movflags", "+faststart",
-		"-y", // sobrescribir si existe
+		"-y",
 		tmpPath,
 	)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("kick: ffmpeg descarga falló para %s: %w", clipID, err)
 	}
