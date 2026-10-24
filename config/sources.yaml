@@ -16,6 +16,12 @@
 
 sources:
   - platform: kick
-    channel_id: xokas
-    channel_name: xokas (kick)
+    channel_id: elmune
+    channel_name: elmune 
     active: true
+
+# sources:
+#   - platform: kick
+#     channel_id: westcol
+#     channel_name: westcol 
+#     active: true
