@@ -7,16 +7,17 @@ package kick
 //
 //  1. Descubrimiento: la API pública no-oficial de kick.com
 //     (https://kick.com/api/v2/channels/{slug}/clips) devuelve los clips más
-//     recientes de un canal en JSON. No requiere autenticación (endpoints
-//     públicos) pero kick.com suele bloquear clientes sin User-Agent de
-//     navegador: se manda una con headers realistas.
+//     recientes de un canal en JSON con clave "clips" (no "data"). No requiere
+//     autenticación (endpoints públicos) pero kick.com suele bloquear clientes
+//     sin User-Agent de navegador: se manda una con headers realistas.
 //
-//  2. Descarga: la respuesta incluye clip.video_filename, la ruta relativa del
-//     MP4 en el CDN (https://files.kick.com/...). Se baja con HTTP directo —
-//     no hace falta TwitchDownloaderCLI para Kick.
+//  2. Descarga: la respuesta incluye clip.video_url, una URL de playlist HLS
+//     (.m3u8) en clips.kick.com. Se baja con ffmpeg (ya instalado en el
+//     contenedor) que remuxe a MP4: ffmpeg -i <m3u8> -c copy output.mp4.
+//     No hace falta TwitchDownloaderCLI para Kick.
 //
 // ESTABILIDAD: la API de kick.com NO es oficial ni documentada; puede cambiar
-// sin aviso. Todo endpoint/URL es sobrescribible (SetBaseURL / SetFilesURL)
+// sin aviso. Todo endpoint/URL es sobrescribible (SetBaseURL)
 // para tests y para mover el base si cambia el CDN.
 //
 // channel_id para Kick = slug del canal (ej: "illojuan" de kick.com/illojuan).
@@ -25,12 +26,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/juankos0714/clipfactory/internal/adapter/twitch" // twitch.ClipInfo: estructura neutra de metadata
@@ -38,8 +38,7 @@ import (
 
 // Endpoints por defecto (sobrescribibles para tests).
 const (
-	DefaultBaseURL  = "https://kick.com"
-	DefaultFilesURL = "https://files.kick.com"
+	DefaultBaseURL = "https://kick.com"
 )
 
 // userAgent realista: kick.com bloquea clientes que no parecen navegador.
@@ -50,7 +49,6 @@ const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 type KickAdapter struct {
 	HTTPClient *http.Client
 	BaseURL    string // API pública de kick.com (sobrescribible en tests)
-	FilesURL   string // CDN de archivos (sobrescribible en tests)
 }
 
 // NewKickAdapter crea un adaptador de Kick con defaults de producción.
@@ -58,15 +56,11 @@ func NewKickAdapter() *KickAdapter {
 	return &KickAdapter{
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
 		BaseURL:    DefaultBaseURL,
-		FilesURL:   DefaultFilesURL,
 	}
 }
 
 // SetBaseURL configura la URL de la API (tests).
 func (a *KickAdapter) SetBaseURL(u string) { a.BaseURL = u }
-
-// SetFilesURL configura la URL del CDN de archivos (tests).
-func (a *KickAdapter) SetFilesURL(u string) { a.FilesURL = u }
 
 // ValidateCredentials verifica la configuración mínima (Kick no requiere
 // credenciales: los endpoints de clips son públicos).
@@ -78,16 +72,17 @@ func (a *KickAdapter) ValidateCredentials() error {
 }
 
 // kickClip es un clip individual de la respuesta de /api/v2/channels/{slug}/clips.
-// Solo se declaran los campos que ClipFactory usa.
+// Solo se declaran los campos que ClipFactory usa. La API devuelve clave "clips"
+// (no "data") y el video es una playlist HLS (.m3u8), no un MP4 directo.
 type kickClip struct {
-	ID            string  `json:"id"`
-	Slug          string  `json:"slug"` // identificador público del clip (en la URL)
-	Title         string  `json:"title"`
-	Duration      float64 `json:"duration"`   // segundos
-	CreatedAt     string  `json:"created_at"` // formato RFC3339 con offset ("2026-09-01T12:00:00Z" o +00:00)
-	ThumbnailURL  string  `json:"thumbnail_url"`
-	VideoFilename string  `json:"video_filename"` // ruta del MP4 en el CDN
-	Channel       struct {
+	ID           string  `json:"id"`
+	Title        string  `json:"title"`
+	Duration     float64 `json:"duration"`   // segundos
+	CreatedAt    string  `json:"created_at"` // formato RFC3339 con offset ("2026-10-24T03:46:22.964793Z")
+	ThumbnailURL string  `json:"thumbnail_url"`
+	VideoURL     string  `json:"video_url"`   // playlist HLS (.m3u8) en clips.kick.com
+	ViewCount    int64   `json:"view_count"`  // cantidad de visualizaciones
+	Channel      struct {
 		ID       int64  `json:"id"`
 		Slug     string `json:"slug"`
 		Username string `json:"username"`
@@ -97,34 +92,31 @@ type kickClip struct {
 // toClipInfo mapea un clip de Kick a la estructura neutra de ClipFactory
 // (twitch.ClipInfo — el worker trabaja con ese tipo, plataforma-agnóstico).
 func (k kickClip) toClipInfo() (twitch.ClipInfo, error) {
-	if k.Slug == "" && k.ID == "" {
-		return twitch.ClipInfo{}, fmt.Errorf("kick: clip sin id ni slug")
-	}
-	id := k.Slug
-	if id == "" {
-		id = k.ID
+	if k.ID == "" {
+		return twitch.ClipInfo{}, fmt.Errorf("kick: clip sin id")
 	}
 
 	createdAt, err := time.Parse(time.RFC3339, k.CreatedAt)
 	if err != nil {
-		return twitch.ClipInfo{}, fmt.Errorf("kick: clip %s: parse created_at %q: %w", id, k.CreatedAt, err)
+		return twitch.ClipInfo{}, fmt.Errorf("kick: clip %s: parse created_at %q: %w", k.ID, k.CreatedAt, err)
 	}
 
 	return twitch.ClipInfo{
-		ID:           id,
+		ID:           k.ID,
 		Title:        k.Title,
 		DurationSec:  k.Duration,
 		CreatedAt:    createdAt.UTC(),
 		ThumbnailURL: k.ThumbnailURL,
-		VideoURL:     k.VideoFilename, // ruta relativa del CDN; DownloadClip la resuelve
+		VideoURL:     k.VideoURL, // URL HLS (playlist .m3u8); DownloadClip la usa con ffmpeg
 		ChannelID:    k.Channel.Slug,
 		ChannelName:  k.Channel.Username,
 	}, nil
 }
 
 // clipsResponse es la envolvente de la lista de clips.
+// La API usa "clips" (no "data").
 type clipsResponse struct {
-	Data []kickClip `json:"data"`
+	Clips []kickClip `json:"clips"`
 }
 
 // ListClips lista los clips más recientes de un canal de Kick.
@@ -173,7 +165,7 @@ func (a *KickAdapter) ListClips(ctx context.Context, channelID string, afterTime
 	}
 
 	var clips []twitch.ClipInfo
-	for _, kc := range parsed.Data {
+	for _, kc := range parsed.Clips {
 		clip, err := kc.toClipInfo()
 		if err != nil {
 			return nil, err
@@ -187,15 +179,15 @@ func (a *KickAdapter) ListClips(ctx context.Context, channelID string, afterTime
 	return clips, nil
 }
 
-// DownloadClip descarga el MP4 de un clip de Kick al destino indicado.
+// DownloadClip descarga el clip de Kick al destino indicado.
 //
-// clipID es el slug del clip (lo mismo que ClipInfo.ID). La URL del archivo se
-// resuelve en dos pasos para no depender de otro endpoint:
-//  1. GET /api/v2/clips/{slug} → video_filename (ruta relativa en el CDN)
-//  2. GET {FilesURL}{video_filename} → bytes del MP4
+// clipID es el ID del clip (campo "id" de la API). La URL del video se
+// resuelve en dos pasos:
+//  1. GET /api/v2/clips/{clipID} → video_url (playlist HLS .m3u8)
+//  2. ffmpeg -i <m3u8> -c copy -movflags +faststart output.mp4
 //
-// El archivo se baja a .part y se renombra al final (atomicidad, igual que el
-// adaptador de Twitch).
+// El archivo se baja a .part y se renombra al final (atomicidad).
+// Se requiere ffmpeg instalado en el sistema (ya incluido en la imagen Docker).
 func (a *KickAdapter) DownloadClip(ctx context.Context, clipID string, destPath string) error {
 	if clipID == "" {
 		return fmt.Errorf("kick: clipID vacío")
@@ -204,7 +196,7 @@ func (a *KickAdapter) DownloadClip(ctx context.Context, clipID string, destPath 
 		return fmt.Errorf("kick: destPath vacío")
 	}
 
-	// paso 1: resolver el video_filename del clip
+	// paso 1: resolver el video_url del clip (playlist HLS)
 	endpoint := fmt.Sprintf("%s/api/v2/clips/%s", a.BaseURL, url.PathEscape(clipID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -226,57 +218,42 @@ func (a *KickAdapter) DownloadClip(ctx context.Context, clipID string, destPath 
 	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
 		return fmt.Errorf("kick: decode clip response: %w", err)
 	}
-	if detail.VideoFilename == "" {
-		return fmt.Errorf("kick: clip %s sin video_filename", clipID)
+	if detail.VideoURL == "" {
+		return fmt.Errorf("kick: clip %s sin video_url", clipID)
 	}
 
-	// paso 2: bajar el MP4 del CDN
-	fileURL := detail.VideoFilename
-	if !strings.HasPrefix(fileURL, "http") {
-		fileURL = a.FilesURL + fileURL
-	}
-	fileReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
-	if err != nil {
-		return fmt.Errorf("kick: create file request: %w", err)
-	}
-	fileReq.Header.Set("User-Agent", userAgent)
-
-	fileResp, err := a.HTTPClient.Do(fileReq)
-	if err != nil {
-		return fmt.Errorf("kick: file download: %w", err)
-	}
-	defer fileResp.Body.Close()
-	if fileResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("kick: file download devolvió %d para %s", fileResp.StatusCode, fileURL)
-	}
-
-	// asegurar el directorio destino (data/incoming puede no existir aún)
+	// asegurar el directorio destino antes de que ffmpeg escriba
 	if dir := filepath.Dir(destPath); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("kick: create dest dir: %w", err)
 		}
 	}
 
-	// bajar a .part y renombrar (atomicidad: no dejar un mp4 corrupto con el
-	// nombre final si el proceso muere a mitad)
+	// paso 2: descargar HLS y remuxear a MP4 con ffmpeg (escrito a .part para atomicidad)
 	tmpPath := destPath + ".part"
 	defer os.Remove(tmpPath) // no-op si el rename fue exitoso
 
-	out, err := os.Create(tmpPath)
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-i", detail.VideoURL,
+		"-c", "copy",
+		"-movflags", "+faststart",
+		"-y", // sobrescribir si existe
+		tmpPath,
+	)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("kick: ffmpeg descarga falló para %s: %w", clipID, err)
+	}
+
+	// verificar que el archivo no esté vacío
+	info, err := os.Stat(tmpPath)
 	if err != nil {
-		return fmt.Errorf("kick: create temp file: %w", err)
+		return fmt.Errorf("kick: stat archivo descargado: %w", err)
 	}
-	written, err := io.Copy(out, fileResp.Body)
-	if cerr := out.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return fmt.Errorf("kick: escribir archivo: %w", err)
-	}
-	if written == 0 {
+	if info.Size() == 0 {
 		return fmt.Errorf("kick: archivo vacío para clip %s", clipID)
 	}
 
+	// renombrar atómicamente
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		return fmt.Errorf("kick: rename %s → %s: %w", tmpPath, destPath, err)
 	}

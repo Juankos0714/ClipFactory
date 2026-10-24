@@ -7,47 +7,48 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-// clipsJSON es una respuesta mínima de /api/v2/channels/{slug}/clips.
+// clipsJSON es una respuesta mínima de /api/v2/channels/{slug}/clips (formato actual de Kick).
 const clipsJSON = `{
-  "data": [
+  "clips": [
     {
-      "id": "c-1",
-      "slug": "clip-reciente",
+      "id": "clip-reciente",
       "title": "Clip reciente",
       "duration": 42.5,
       "created_at": "2026-09-10T12:00:00Z",
-      "thumbnail_url": "https://files.kick.com/thumbs/c-1.jpg",
-      "video_filename": "/thumbnails/c-1/720p.mp4",
+      "thumbnail_url": "https://clips.kick.com/thumbs/c-1.jpg",
+      "video_url": "https://clips.kick.com/clips/d3/clip-reciente/playlist.m3u8",
+      "view_count": 100,
       "channel": {"id": 7, "slug": "illojuan", "username": "illojuan"}
     },
     {
-      "id": "c-2",
-      "slug": "clip-viejo",
+      "id": "clip-viejo",
       "title": "Clip viejo",
       "duration": 30,
       "created_at": "2026-08-01T12:00:00Z",
+      "thumbnail_url": "https://clips.kick.com/thumbs/c-2.jpg",
+      "video_url": "https://clips.kick.com/clips/d4/clip-viejo/playlist.m3u8",
+      "view_count": 50,
       "channel": {"id": 7, "slug": "illojuan", "username": "illojuan"}
     }
-  ]
+  ],
+  "nextCursor": "{\"view\":0,\"id\":\"clip-viejo\"}"
 }`
 
-// clipDetailJSON es la respuesta de /api/v2/clips/{slug}.
+// clipDetailJSON es la respuesta de /api/v2/clips/{id} (formato actual de Kick).
 const clipDetailJSON = `{
-  "id": "c-1",
-  "slug": "clip-reciente",
-  "video_filename": "/thumbnails/c-1/720p.mp4"
+  "id": "clip-reciente",
+  "video_url": "https://clips.kick.com/clips/d3/clip-reciente/playlist.m3u8"
 }`
 
 // newTestAdapter arma un KickAdapter apuntando a un servidor de prueba con un
-// mux mínimo que simula la API (lista de clips, detalle y archivo del CDN).
-func newTestAdapter(t *testing.T, listStatus, detailStatus, fileStatus int) (*KickAdapter, string) {
+// mux mínimo que simula la API (lista de clips y detalle del clip).
+func newTestAdapter(t *testing.T, listStatus, detailStatus int) (*KickAdapter, string) {
 	t.Helper()
 
 	mux := http.NewServeMux()
@@ -64,22 +65,17 @@ func newTestAdapter(t *testing.T, listStatus, detailStatus, fileStatus int) (*Ki
 		w.WriteHeader(detailStatus)
 		_, _ = w.Write([]byte(clipDetailJSON))
 	})
-	mux.HandleFunc("/thumbnails/c-1/720p.mp4", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(fileStatus)
-		_, _ = w.Write([]byte("fake-mp4-bytes"))
-	})
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
 	a := NewKickAdapter()
 	a.SetBaseURL(srv.URL)
-	a.SetFilesURL(srv.URL)
 	return a, srv.URL
 }
 
 func TestListClipsOK(t *testing.T) {
-	a, _ := newTestAdapter(t, http.StatusOK, http.StatusOK, http.StatusOK)
+	a, _ := newTestAdapter(t, http.StatusOK, http.StatusOK)
 
 	// sin filtro temporal: trae todos
 	clips, err := a.ListClips(context.Background(), "illojuan", time.Time{})
@@ -96,8 +92,8 @@ func TestListClipsOK(t *testing.T) {
 	if first.ChannelID != "illojuan" {
 		t.Errorf("expected channel slug as ChannelID, got %q", first.ChannelID)
 	}
-	if first.VideoURL != "/thumbnails/c-1/720p.mp4" {
-		t.Errorf("expected video_filename in VideoURL, got %q", first.VideoURL)
+	if first.VideoURL != "https://clips.kick.com/clips/d3/clip-reciente/playlist.m3u8" {
+		t.Errorf("expected video_url (HLS) in VideoURL, got %q", first.VideoURL)
 	}
 
 	// con filtro temporal: solo el clip de septiembre
@@ -111,7 +107,7 @@ func TestListClipsOK(t *testing.T) {
 }
 
 func TestListClipsChannelNotFound(t *testing.T) {
-	a, _ := newTestAdapter(t, http.StatusNotFound, http.StatusOK, http.StatusOK)
+	a, _ := newTestAdapter(t, http.StatusNotFound, http.StatusOK)
 
 	_, err := a.ListClips(context.Background(), "no-existe", time.Time{})
 	if err == nil {
@@ -123,7 +119,7 @@ func TestListClipsChannelNotFound(t *testing.T) {
 }
 
 func TestListClipsBadJSON(t *testing.T) {
-	a, _ := newTestAdapter(t, http.StatusOK, http.StatusOK, http.StatusOK)
+	a, _ := newTestAdapter(t, http.StatusOK, http.StatusOK)
 	// sobrescribir el handler con contenido inválido
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v2/channels/illojuan/clips", func(w http.ResponseWriter, r *http.Request) {
@@ -141,7 +137,7 @@ func TestListClipsBadJSON(t *testing.T) {
 func TestListClipsInvalidCreatedAt(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v2/channels/illojuan/clips", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"slug":"x","created_at":"no-es-fecha"}]}`))
+		_, _ = w.Write([]byte(`{"clips":[{"id":"x","created_at":"no-es-fecha"}]}`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -153,29 +149,8 @@ func TestListClipsInvalidCreatedAt(t *testing.T) {
 	}
 }
 
-func TestDownloadClipOK(t *testing.T) {
-	a, _ := newTestAdapter(t, http.StatusOK, http.StatusOK, http.StatusOK)
-
-	dest := filepath.Join(t.TempDir(), "incoming", "clip-reciente.mp4")
-	if err := a.DownloadClip(context.Background(), "clip-reciente", dest); err != nil {
-		t.Fatalf("DownloadClip: %v", err)
-	}
-
-	bs, err := os.ReadFile(dest)
-	if err != nil {
-		t.Fatalf("read downloaded file: %v", err)
-	}
-	if string(bs) != "fake-mp4-bytes" {
-		t.Errorf("unexpected file content: %q", string(bs))
-	}
-	// atomicidad: no debe quedar el .part
-	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
-		t.Error("expected no leftover .part file")
-	}
-}
-
 func TestDownloadClipDetailFails(t *testing.T) {
-	a, _ := newTestAdapter(t, http.StatusOK, http.StatusInternalServerError, http.StatusOK)
+	a, _ := newTestAdapter(t, http.StatusOK, http.StatusInternalServerError)
 
 	dest := filepath.Join(t.TempDir(), "clip.mp4")
 	if err := a.DownloadClip(context.Background(), "clip-reciente", dest); err == nil {
@@ -183,19 +158,10 @@ func TestDownloadClipDetailFails(t *testing.T) {
 	}
 }
 
-func TestDownloadClipFileFails(t *testing.T) {
-	a, _ := newTestAdapter(t, http.StatusOK, http.StatusOK, http.StatusForbidden)
-
-	dest := filepath.Join(t.TempDir(), "clip.mp4")
-	if err := a.DownloadClip(context.Background(), "clip-reciente", dest); err == nil {
-		t.Error("expected error when CDN file download fails")
-	}
-}
-
-func TestDownloadClipNoVideoFilename(t *testing.T) {
+func TestDownloadClipNoVideoURL(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v2/clips/clip-reciente", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"id":"c-1","slug":"clip-reciente"}`))
+		_, _ = w.Write([]byte(`{"id":"clip-reciente"}`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -204,7 +170,7 @@ func TestDownloadClipNoVideoFilename(t *testing.T) {
 	a.SetBaseURL(srv.URL)
 	dest := filepath.Join(t.TempDir(), "clip.mp4")
 	if err := a.DownloadClip(context.Background(), "clip-reciente", dest); err == nil {
-		t.Error("expected error when clip has no video_filename")
+		t.Error("expected error when clip has no video_url")
 	}
 }
 
@@ -219,18 +185,18 @@ func TestDownloadClipValidation(t *testing.T) {
 }
 
 func TestToClipInfoIDFallback(t *testing.T) {
-	// sin slug: usa id como fallback
+	// solo id: usa id directamente
 	kc := kickClip{ID: "only-id", CreatedAt: "2026-09-01T10:00:00Z"}
 	info, err := kc.toClipInfo()
 	if err != nil {
 		t.Fatalf("toClipInfo: %v", err)
 	}
 	if info.ID != "only-id" {
-		t.Errorf("expected ID fallback to id, got %q", info.ID)
+		t.Errorf("expected ID to be id, got %q", info.ID)
 	}
 
 	// created_at corrupto: error
-	kc2 := kickClip{Slug: "x", CreatedAt: "garbage"}
+	kc2 := kickClip{ID: "x", CreatedAt: "garbage"}
 	if _, err := kc2.toClipInfo(); err == nil {
 		t.Error("expected error for invalid created_at")
 	}
