@@ -42,8 +42,10 @@ const clipsJSON = `{
 
 // clipDetailJSON es la respuesta de /api/v2/clips/{id} (formato actual de Kick).
 const clipDetailJSON = `{
-  "id": "clip-reciente",
-  "video_url": "https://clips.kick.com/clips/d3/clip-reciente/playlist.m3u8"
+  "clip": {
+    "id": "clip-reciente",
+    "video_url": "https://clips.kick.com/clips/d3/clip-reciente/playlist.m3u8"
+  }
 }`
 
 // newTestAdapter arma un KickAdapter apuntando a un servidor de prueba con un
@@ -161,7 +163,7 @@ func TestDownloadClipDetailFails(t *testing.T) {
 func TestDownloadClipNoVideoURL(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v2/clips/clip-reciente", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"id":"clip-reciente"}`))
+		_, _ = w.Write([]byte(`{"clip":{"id":"clip-reciente"}}`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

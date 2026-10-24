@@ -214,10 +214,13 @@ func (a *KickAdapter) DownloadClip(ctx context.Context, clipID string, destPath 
 		return fmt.Errorf("kick: clip request devolvió %d para %s", resp.StatusCode, clipID)
 	}
 
-	var detail kickClip
-	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+	var detailResp struct {
+	Clip kickClip `json:"clip"`
+}
+	if err := json.NewDecoder(resp.Body).Decode(&detailResp); err != nil {
 		return fmt.Errorf("kick: decode clip response: %w", err)
 	}
+	detail := detailResp.Clip
 	if detail.VideoURL == "" {
 		return fmt.Errorf("kick: clip %s sin video_url", clipID)
 	}
